@@ -81,6 +81,31 @@ python3 -m app.main
 
 Таблицы БД создаются автоматически при старте (`Repository._migrate()`).
 
+## Быстрый гайд (10 минут)
+1. Подготовить `.env`:
+```bash
+cp .env.example .env
+```
+2. Запустить PostgreSQL:
+```bash
+docker compose up -d
+```
+3. В отдельном терминале запустить mock мастер-ноду:
+```bash
+python3 -m app.mock_master_node
+```
+4. В отдельном терминале запустить бота:
+```bash
+python3 -m app.main
+```
+5. В Telegram открыть бота и отправить только `/start`.
+6. Пройти сценарий:
+- `Купить VPN` -> `Готовые тарифы` или `Создать свой тариф`
+- выбрать оплату (для локального теста проще всего `СБП`)
+- в симуляции нажать `Успешная оплата`
+- дождаться выдачи конфига от mock мастер-ноды
+- проверить `Мои покупки` и `Мои конфиги` в главном меню.
+
 ## Mock master-node (для локальных тестов)
 Можно поднять простой mock API мастер-ноды на `127.0.0.1:6767`:
 
@@ -110,11 +135,56 @@ python3 -m app.mock_master_node
 - `pricing.custom.base_usd_per_month`
 - `pricing.custom.extra_device_usd_per_month`
 
+Примеры `plan_code` для готовых тарифов:
+- `ready:entry:1`
+- `ready:standard:3`
+- `ready:premium:12`
+
+Примеры SQL:
+```sql
+-- Курс валюты
+INSERT INTO config_kv(key, value) VALUES ('pricing.usd_to_rub', '80')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+
+-- Цена конкретного готового тарифа (STANDARD 1 месяц)
+INSERT INTO config_kv(key, value) VALUES ('pricing.plan.ready:standard:1.usd', '4.99')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+
+-- Формула custom тарифа
+INSERT INTO config_kv(key, value) VALUES ('pricing.custom.base_usd_per_month', '3.50')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+INSERT INTO config_kv(key, value) VALUES ('pricing.custom.extra_device_usd_per_month', '1.10')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+```
+
+## Гайд по БД (что смотреть при тестах)
+```sql
+-- Заказы пользователя
+SELECT id, tg_id, plan, server, protocol, payment_method, amount_usd_numeric, status, created_at
+FROM vpn_orders
+ORDER BY id DESC;
+
+-- События оплат
+SELECT id, order_id, payment_method, event_type, details, created_at
+FROM payment_events
+ORDER BY id DESC;
+
+-- Конфиги пользователя
+SELECT id, tg_id, server_id, protocol, status, task_id, expiration_date, updated_at
+FROM connections
+ORDER BY id DESC;
+
+-- Пинг и статус серверов (приходит с мастер-ноды)
+SELECT server_id, country, status, ping_ms, updated_at
+FROM server_data
+ORDER BY country, server_id;
+```
+
 ## Бизнес-флоу
 1. `/start` -> главное меню.
 2. `Купить VPN` -> `Готовые тарифы` или `Создать свой тариф`.
 3. `Готовые тарифы`: семейство тарифа -> длительность -> оплата -> summary.
-4. `Создать свой тариф`: страна -> протокол -> длительность -> устройства -> оплата -> summary.
+4. `Создать свой тариф`: страна -> сервер (node + ping) -> протокол -> длительность -> устройства -> оплата -> summary.
 5. `pay:start` создает заказ в `vpn_orders` со статусом `pending`.
 6. Дальше зависит от платежного метода:
 - `sbp`: локальная эмуляция результата.
@@ -138,6 +208,10 @@ python3 -m app.mock_master_node
 - Навигация "Назад" не откатывает состояние `draft_orders`, только экран.
 - Для `custom` тарифа цена считается формулой-заглушкой в `app/services/catalog.py`.
 - Выдача конфига берется из ответа мастер-ноды, технические детали отправляются в логи.
+
+## Ограничения интерфейса
+- Telegram Bot API не поддерживает произвольную раскраску inline-кнопок во всех клиентах.
+- В Bot API 9.4 добавлены `style`/`icon_custom_emoji_id`; отображение зависит от клиента Telegram и может отличаться.
 
 ## Полезные команды
 ```bash
