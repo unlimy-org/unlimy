@@ -1,63 +1,113 @@
 # VPN Telegram Bot (MVP)
 
-MVP Telegram bot for VPN sales:
-- inline-only flow (no text dialogs)
-- multilingual UI (RU/EN/UZ/KK/TG)
-- clean step-by-step screens (previous bot message is deleted)
-- PostgreSQL for users, draft orders, final orders, and payment event logs
-- master->slave provisioning queue stub (after payment)
-- payment modes:
-  - SBP as local simulator (success/failed/cancel)
-  - Telegram Stars (real invoice flow)
-  - Crypto Bot (real invoice + status check)
+Телеграм-бот для продажи VPN с inline-сценарием и хранением состояния в PostgreSQL.
 
-## Stack
-- Python 3.11+
+## Что реализовано
+- Полностью inline UX: выбор тарифа, сервера, протокола и оплаты через кнопки.
+- Мультиязычность: `ru`, `en`, `uz`, `kk`, `tg`.
+- Один активный экран: предыдущее сообщение бота удаляется.
+- Платежные ветки:
+- `SBP` как локальная симуляция (`success`, `failed`, `cancel`).
+- `Telegram Stars` через `send_invoice` (валюта `XTR`).
+- `Crypto Bot` через API (`createInvoice`, `getInvoices`).
+- После успешной оплаты создается `provisioning_job` (stub master -> slave).
+
+## Технологии
+- Python 3.12+
 - aiogram 3
-- PostgreSQL
+- asyncpg
+- PostgreSQL 16 (через Docker Compose)
 
-## Quick start
-1. Copy env:
+## Структура проекта
+```text
+app/
+  main.py                 # Точка входа, DI и polling
+  config.py               # Загрузка ENV в Settings
+  handlers/start.py       # /start, кнопки, платежи, back-навигация
+  keyboards/inline.py     # Inline клавиатуры
+  locales/translations.py # Словари переводов и tr()
+  db/repository.py        # Работа с БД + автосоздание таблиц
+  services/
+    catalog.py            # Справочники тарифов/цен/методов
+    cryptobot.py          # Клиент Crypto Pay API
+    provisioning.py       # Stub-оркестратор задач выдачи конфига
+    ui.py                 # replace/delete bot message
+docker-compose.yml        # PostgreSQL
+requirements.txt
+```
+
+## Переменные окружения
+Создайте `.env` из шаблона:
+
 ```bash
 cp .env.example .env
 ```
-2. Set `BOT_TOKEN` in `.env`.
-3. Configure payment vars in `.env`:
-```env
-STARS_ENABLED=true
-CRYPTOBOT_ENABLED=true
-CRYPTOBOT_TOKEN=your_crypto_pay_api_token
-CRYPTOBOT_ASSET=USDT
-CRYPTOBOT_API_BASE=https://pay.crypt.bot/api
-```
-4. Start PostgreSQL:
+
+Обязательные:
+- `BOT_TOKEN`
+- `DATABASE_URL`
+
+Опциональные:
+- `DEFAULT_LANGUAGE=ru`
+- `STARS_ENABLED=true`
+- `CRYPTOBOT_ENABLED=true`
+- `CRYPTOBOT_TOKEN=...`
+- `CRYPTOBOT_ASSET=USDT`
+- `CRYPTOBOT_API_BASE=https://pay.crypt.bot/api`
+
+## Локальный запуск
+1. Поднять PostgreSQL:
 ```bash
 docker compose up -d
 ```
-5. Install deps:
+2. Создать окружение и поставить зависимости:
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
-6. Run bot:
+3. Запустить бота:
 ```bash
-python -m app.main
+python3 -m app.main
 ```
 
-## Flow
-`/start` -> Main menu  
-`Buy VPN` -> Plan -> Server -> Protocol -> Payment -> Summary -> Start payment  
-Payment branch:
-- `SBP` -> local simulation (success/failed/cancel)
-- `Telegram Stars` -> Telegram invoice (XTR) -> auto confirmation
-- `Crypto Bot` -> external invoice link -> check payment
-`Change language` -> Language list -> Main menu
+Таблицы БД создаются автоматически при старте (`Repository._migrate()`).
 
-Back button exists on each step.
+## Бизнес-флоу
+1. `/start` -> главное меню.
+2. `Купить VPN` -> тариф -> сервер -> протокол -> метод оплаты -> summary.
+3. `pay:start` создает заказ в `vpn_orders` со статусом `pending`.
+4. Дальше зависит от платежного метода:
+- `sbp`: локальная эмуляция результата.
+- `stars`: invoice в Telegram, подтверждение через `successful_payment`.
+- `cryptobot`: ссылка на оплату + ручная проверка статуса кнопкой.
+5. При успехе:
+- статус заказа `paid`
+- запись в `payment_events`
+- сброс `draft_orders`
+- постановка задачи в `provisioning_jobs`
 
-## Notes
-- Any user text message is ignored except `/start`.
-- User language is auto-detected from Telegram `language_code` on first `/start`.
-- On successful payment, user sees a purchase-confirmation screen with selected plan/server/protocol/payment (placeholder text can be replaced later).
-- On successful payment, master node creates a stub provisioning task for slave node config generation and shows task info to user.
+## Схема данных (кратко)
+- `users`: язык, id последнего сообщения бота.
+- `draft_orders`: незавершенный выбор пользователя.
+- `vpn_orders`: финальные заказы и статус оплаты.
+- `payment_events`: аудит платежных событий.
+- `provisioning_jobs`: очередь задач подготовки VPN-конфига (stub).
+
+## Что важно для разработчиков
+- Любые текстовые сообщения (кроме `/start`) игнорируются намеренно.
+- Навигация "Назад" не откатывает состояние `draft_orders`, только экран.
+- В `PLAN_PRICES_STARS` сейчас значения отличаются от USD и заданы вручную.
+- Реальной выдачи VPN-конфигов пока нет, только постановка stub-задачи.
+
+## Полезные команды
+```bash
+# Проверка контейнера БД
+docker compose ps
+
+# Логи PostgreSQL
+docker compose logs -f postgres
+
+# Остановка окружения
+docker compose down
+```
