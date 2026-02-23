@@ -1,7 +1,17 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.locales.translations import LANGUAGE_LABELS, tr
-from app.services.catalog import PAYMENT_KEYS, PLAN_KEYS, PROTOCOL_KEYS, SERVER_KEYS
+from app.services.catalog import (
+    CUSTOM_DEVICE_OPTIONS,
+    CUSTOM_MONTH_OPTIONS,
+    PAYMENT_KEYS,
+    PROTOCOL_KEYS,
+    SERVER_KEYS,
+    list_ready_options,
+    list_ready_plans,
+    ready_option_button_label,
+    ready_plan_button_label,
+)
 
 
 def main_menu(lang: str) -> InlineKeyboardMarkup:
@@ -9,6 +19,16 @@ def main_menu(lang: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=tr(lang, "menu_buy"), callback_data="menu:buy", style="primary")],
             [InlineKeyboardButton(text=tr(lang, "menu_lang"), callback_data="menu:lang")],
+        ]
+    )
+
+
+def buy_menu(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=tr(lang, "buy_ready"), callback_data="buy:ready", style="primary")],
+            [InlineKeyboardButton(text=tr(lang, "buy_custom"), callback_data="buy:custom")],
+            [InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:main")],
         ]
     )
 
@@ -22,30 +42,74 @@ def language_menu(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def plan_menu(lang: str) -> InlineKeyboardMarkup:
+def ready_plan_menu(lang: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=tr(lang, f"plan_{key}"), callback_data=f"plan:{key}")]
-        for key in PLAN_KEYS
+        [InlineKeyboardButton(text=ready_plan_button_label(plan), callback_data=f"ready_plan:{plan.code}")]
+        for plan in list_ready_plans()
     ]
-    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:main")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "ready_details_btn"), callback_data="ready:info")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "buy_custom"), callback_data="buy:custom")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:buy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def server_menu(lang: str) -> InlineKeyboardMarkup:
+def ready_months_menu(lang: str, plan_code: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=tr(lang, f"server_{key}"), callback_data=f"server:{key}")]
+        [InlineKeyboardButton(text=ready_option_button_label(opt), callback_data=f"ready_month:{plan_code}:{opt.months}")]
+        for opt in list_ready_options(plan_code)
+    ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "buy_custom"), callback_data="buy:custom")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="buy:ready")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ready_info_menu(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=tr(lang, "buy_custom"), callback_data="buy:custom")],
+            [InlineKeyboardButton(text=tr(lang, "back"), callback_data="buy:ready")],
+        ]
+    )
+
+
+def custom_server_menu(lang: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=tr(lang, f"server_{key}"), callback_data=f"custom_server:{key}")]
         for key in SERVER_KEYS
     ]
-    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:plan")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:buy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def protocol_menu(lang: str) -> InlineKeyboardMarkup:
+def custom_protocol_menu(lang: str, server: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=key.title(), callback_data=f"protocol:{key}")]
+        [InlineKeyboardButton(text=key.title(), callback_data=f"custom_protocol:{server}:{key}")]
         for key in PROTOCOL_KEYS
     ]
-    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:server")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="buy:custom")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def custom_months_menu(lang: str, server: str, protocol: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{m} мес", callback_data=f"custom_month:{server}:{protocol}:{m}")]
+        for m in CUSTOM_MONTH_OPTIONS
+    ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data=f"custom_server:{server}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def custom_devices_menu(lang: str, server: str, protocol: str, months: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{d} устр.",
+                callback_data=f"custom_devices:{server}:{protocol}:{months}:{d}",
+            )
+        ]
+        for d in CUSTOM_DEVICE_OPTIONS
+    ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data=f"custom_protocol:{server}:{protocol}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -54,7 +118,7 @@ def payment_menu(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=tr(lang, f"payment_{key}"), callback_data=f"payment:{key}")]
         for key in PAYMENT_KEYS
     ]
-    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:protocol")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:buy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -63,7 +127,7 @@ def summary_menu(lang: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=tr(lang, "summary_pay"), callback_data="pay:start", style="success")],
             [InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:payment")],
-            [InlineKeyboardButton(text=tr(lang, "menu_buy"), callback_data="menu:buy")],
+            [InlineKeyboardButton(text=tr(lang, "back_to_main"), callback_data="back:main")],
         ]
     )
 
@@ -71,27 +135,9 @@ def summary_menu(lang: str) -> InlineKeyboardMarkup:
 def payment_simulation_menu(lang: str, order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=tr(lang, "pay_success"),
-                    callback_data=f"pay:result:success:{order_id}",
-                    style="success",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=tr(lang, "pay_failed"),
-                    callback_data=f"pay:result:failed:{order_id}",
-                    style="danger",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=tr(lang, "pay_cancel"),
-                    callback_data=f"pay:result:cancel:{order_id}",
-                    style="danger",
-                )
-            ],
+            [InlineKeyboardButton(text=tr(lang, "pay_success"), callback_data=f"pay:result:success:{order_id}", style="success")],
+            [InlineKeyboardButton(text=tr(lang, "pay_failed"), callback_data=f"pay:result:failed:{order_id}", style="danger")],
+            [InlineKeyboardButton(text=tr(lang, "pay_cancel"), callback_data=f"pay:result:cancel:{order_id}", style="danger")],
             [InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:payment")],
         ]
     )
@@ -120,13 +166,7 @@ def cryptobot_invoice_menu(lang: str, order_id: int, invoice_id: int, pay_url: s
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=tr(lang, "cryptobot_open_invoice"), url=pay_url)],
-            [
-                InlineKeyboardButton(
-                    text=tr(lang, "cryptobot_check_payment"),
-                    callback_data=f"pay:check:cryptobot:{order_id}:{invoice_id}",
-                    style="primary",
-                )
-            ],
+            [InlineKeyboardButton(text=tr(lang, "cryptobot_check_payment"), callback_data=f"pay:check:cryptobot:{order_id}:{invoice_id}", style="primary")],
             [InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:payment")],
         ]
     )

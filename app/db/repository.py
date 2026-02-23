@@ -11,6 +11,8 @@ class UserData:
     tg_id: int
     language: str
     last_bot_message_id: Optional[int]
+    preferred_server: Optional[str]
+    preferred_protocol: Optional[str]
 
 
 @dataclass
@@ -29,7 +31,7 @@ class OrderData:
     server: str
     protocol: str
     payment_method: str
-    amount_usd: int
+    amount_usd: str
     status: str
 
 
@@ -69,6 +71,12 @@ class Repository:
                 """
             )
             await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_server TEXT NULL;"
+            )
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_protocol TEXT NULL;"
+            )
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS draft_orders (
                     tg_id BIGINT PRIMARY KEY REFERENCES users(tg_id) ON DELETE CASCADE,
@@ -90,6 +98,7 @@ class Repository:
                     protocol TEXT NOT NULL,
                     payment_method TEXT NOT NULL,
                     amount_usd INTEGER NOT NULL,
+                    amount_usd_numeric NUMERIC(10,2) NULL,
                     status TEXT NOT NULL,
                     failure_reason TEXT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -129,6 +138,10 @@ class Repository:
                 """
             )
 
+            await conn.execute(
+                "ALTER TABLE vpn_orders ADD COLUMN IF NOT EXISTS amount_usd_numeric NUMERIC(10,2) NULL;"
+            )
+
     async def ensure_user(self, tg_id: int, language: str) -> UserData:
         async with self.pool.acquire() as conn:
             await conn.execute(
@@ -141,18 +154,30 @@ class Repository:
                 language,
             )
             row = await conn.fetchrow(
-                "SELECT tg_id, language, last_bot_message_id FROM users WHERE tg_id = $1", tg_id
+                """
+                SELECT tg_id, language, last_bot_message_id, preferred_server, preferred_protocol
+                FROM users
+                WHERE tg_id = $1
+                """,
+                tg_id,
             )
             return UserData(
                 tg_id=row["tg_id"],
                 language=row["language"],
                 last_bot_message_id=row["last_bot_message_id"],
+                preferred_server=row["preferred_server"],
+                preferred_protocol=row["preferred_protocol"],
             )
 
     async def get_user(self, tg_id: int) -> Optional[UserData]:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT tg_id, language, last_bot_message_id FROM users WHERE tg_id = $1", tg_id
+                """
+                SELECT tg_id, language, last_bot_message_id, preferred_server, preferred_protocol
+                FROM users
+                WHERE tg_id = $1
+                """,
+                tg_id,
             )
         if not row:
             return None
@@ -160,6 +185,8 @@ class Repository:
             tg_id=row["tg_id"],
             language=row["language"],
             last_bot_message_id=row["last_bot_message_id"],
+            preferred_server=row["preferred_server"],
+            preferred_protocol=row["preferred_protocol"],
         )
 
     async def set_language(self, tg_id: int, language: str) -> None:
@@ -176,6 +203,19 @@ class Repository:
                 "UPDATE users SET last_bot_message_id = $2, updated_at = NOW() WHERE tg_id = $1",
                 tg_id,
                 message_id,
+            )
+
+    async def set_connection_preferences(self, tg_id: int, server: str, protocol: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET preferred_server = $2, preferred_protocol = $3, updated_at = NOW()
+                WHERE tg_id = $1
+                """,
+                tg_id,
+                server,
+                protocol,
             )
 
     async def upsert_draft(self, tg_id: int, **fields: str) -> None:
@@ -220,7 +260,7 @@ class Repository:
     async def close(self) -> None:
         await self.pool.close()
 
-    async def create_order_from_draft(self, tg_id: int, amount_usd: int) -> Optional[int]:
+    async def create_order_from_draft(self, tg_id: int, amount_usd: str) -> Optional[int]:
         draft = await self.get_draft(tg_id)
         if not draft.plan or not draft.server or not draft.protocol or not draft.payment:
             return None
@@ -229,9 +269,9 @@ class Repository:
             order_id = await conn.fetchval(
                 """
                 INSERT INTO vpn_orders(
-                    tg_id, plan, server, protocol, payment_method, amount_usd, status
+                    tg_id, plan, server, protocol, payment_method, amount_usd, amount_usd_numeric, status
                 )
-                VALUES($1, $2, $3, $4, $5, $6, 'pending')
+                VALUES($1, $2, $3, $4, $5, $6, $7, 'pending')
                 RETURNING id
                 """,
                 tg_id,
@@ -239,6 +279,7 @@ class Repository:
                 draft.server,
                 draft.protocol,
                 draft.payment,
+                int(round(float(amount_usd))),
                 amount_usd,
             )
         return int(order_id)
@@ -247,7 +288,10 @@ class Repository:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, tg_id, plan, server, protocol, payment_method, amount_usd, status
+                SELECT
+                    id, tg_id, plan, server, protocol, payment_method,
+                    COALESCE(amount_usd_numeric::text, amount_usd::text) AS amount_usd,
+                    status
                 FROM vpn_orders
                 WHERE id = $1 AND tg_id = $2
                 """,
