@@ -18,6 +18,8 @@ def main_menu(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=tr(lang, "menu_buy"), callback_data="menu:buy", style="primary")],
+            [InlineKeyboardButton(text=tr(lang, "menu_orders"), callback_data="menu:orders")],
+            [InlineKeyboardButton(text=tr(lang, "menu_configs"), callback_data="menu:configs")],
             [InlineKeyboardButton(text=tr(lang, "menu_lang"), callback_data="menu:lang")],
         ]
     )

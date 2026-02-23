@@ -64,18 +64,6 @@ class ConnectionData:
     task_id: Optional[str]
 
 
-@dataclass
-class ProvisioningJob:
-    id: int
-    order_id: int
-    tg_id: int
-    server: str
-    protocol: str
-    slave_node: str
-    status: str
-    config_stub: Optional[str]
-
-
 class Repository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -150,24 +138,6 @@ class Repository:
                     event_type TEXT NOT NULL,
                     details TEXT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                """
-            )
-
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS provisioning_jobs (
-                    id BIGSERIAL PRIMARY KEY,
-                    order_id BIGINT NOT NULL UNIQUE REFERENCES vpn_orders(id) ON DELETE CASCADE,
-                    tg_id BIGINT NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
-                    server TEXT NOT NULL,
-                    protocol TEXT NOT NULL,
-                    slave_node TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    config_stub TEXT NULL,
-                    notes TEXT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
             )
@@ -654,52 +624,6 @@ class Repository:
         async with self.pool.acquire() as conn:
             value = await conn.fetchval("SELECT value FROM config_kv WHERE key = $1", key)
         return value
-
-    async def create_or_get_provisioning_job(
-        self,
-        order_id: int,
-        tg_id: int,
-        server: str,
-        protocol: str,
-        slave_node: str,
-        status: str = "queued",
-        notes: Optional[str] = None,
-    ) -> ProvisioningJob:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO provisioning_jobs(
-                    order_id, tg_id, server, protocol, slave_node, status, notes
-                )
-                VALUES($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (order_id) DO NOTHING
-                """,
-                order_id,
-                tg_id,
-                server,
-                protocol,
-                slave_node,
-                status,
-                notes,
-            )
-            row = await conn.fetchrow(
-                """
-                SELECT id, order_id, tg_id, server, protocol, slave_node, status, config_stub
-                FROM provisioning_jobs
-                WHERE order_id = $1
-                """,
-                order_id,
-            )
-        return ProvisioningJob(
-            id=row["id"],
-            order_id=row["order_id"],
-            tg_id=row["tg_id"],
-            server=row["server"],
-            protocol=row["protocol"],
-            slave_node=row["slave_node"],
-            status=row["status"],
-            config_stub=row["config_stub"],
-        )
 
     async def close(self) -> None:
         await self.pool.close()

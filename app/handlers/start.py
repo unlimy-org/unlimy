@@ -9,7 +9,7 @@ from typing import Optional
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
 
 from app.db.repository import ConnectionData, OrderData, Repository, ServerData
@@ -517,42 +517,6 @@ async def cmd_start(message: Message, repo: Repository, default_language: str, b
     )
 
 
-@router.message(Command("orders"))
-async def cmd_orders(message: Message, repo: Repository, default_language: str, bot):
-    lang = await _get_user_lang(repo, message.from_user.id, default_language)
-    try:
-        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-    except TelegramBadRequest:
-        pass
-    orders = await repo.list_orders_for_user(message.from_user.id, limit=15)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=message.chat.id,
-        tg_id=message.from_user.id,
-        text=_history_text(lang, orders),
-        reply_markup=main_menu(lang),
-    )
-
-
-@router.message(Command("myconfigs"))
-async def cmd_myconfigs(message: Message, repo: Repository, default_language: str, bot):
-    lang = await _get_user_lang(repo, message.from_user.id, default_language)
-    try:
-        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-    except TelegramBadRequest:
-        pass
-    conns = await repo.list_connections_for_user(message.from_user.id, limit=10)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=message.chat.id,
-        tg_id=message.from_user.id,
-        text=_connections_text(lang, conns),
-        reply_markup=_connections_menu(lang, conns),
-    )
-
-
 @router.pre_checkout_query()
 async def on_pre_checkout(pre_checkout_query: PreCheckoutQuery, repo: Repository, default_language: str):
     lang = await _get_user_lang(repo, pre_checkout_query.from_user.id, default_language)
@@ -629,6 +593,36 @@ async def open_buy_menu(call: CallbackQuery, repo: Repository, default_language:
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await repo.reset_draft(call.from_user.id)
     await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "buy_title"), reply_markup=buy_menu(lang))
+
+
+@router.callback_query(F.data == "menu:orders")
+async def open_orders_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    orders = await repo.list_orders_for_user(call.from_user.id, limit=15)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=_history_text(lang, orders),
+        reply_markup=main_menu(lang),
+    )
+
+
+@router.callback_query(F.data == "menu:configs")
+async def open_configs_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    conns = await repo.list_connections_for_user(call.from_user.id, limit=10)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=_connections_text(lang, conns),
+        reply_markup=_connections_menu(lang, conns),
+    )
 
 
 @router.callback_query(F.data == "buy:ready")
