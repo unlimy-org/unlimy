@@ -1,0 +1,21 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16
+    container_name: vpn_bot_postgres
+    environment:
+      POSTGRES_DB: vpn_bot
+      POSTGRES_USER: vpn_user
+      POSTGRES_PASSWORD: vpn_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpn_user -d vpn_bot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pg_data:

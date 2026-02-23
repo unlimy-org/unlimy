@@ -1,0 +1,46 @@
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+
+@dataclass(frozen=True)
+class Settings:
+    bot_token: str
+    database_url: str
+    default_language: str = "en"
+    stars_enabled: bool = True
+    cryptobot_enabled: bool = False
+    cryptobot_token: str = ""
+    cryptobot_asset: str = "USDT"
+    cryptobot_api_base: str = "https://pay.crypt.bot/api"
+
+
+
+def load_settings() -> Settings:
+    load_dotenv()
+
+    bot_token = os.getenv("BOT_TOKEN", "").strip()
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    default_language = os.getenv("DEFAULT_LANGUAGE", "en").strip().lower()
+    stars_enabled = os.getenv("STARS_ENABLED", "true").strip().lower() == "true"
+    cryptobot_enabled = os.getenv("CRYPTOBOT_ENABLED", "false").strip().lower() == "true"
+    cryptobot_token = os.getenv("CRYPTOBOT_TOKEN", "").strip()
+    cryptobot_asset = os.getenv("CRYPTOBOT_ASSET", "USDT").strip().upper()
+    cryptobot_api_base = os.getenv("CRYPTOBOT_API_BASE", "https://pay.crypt.bot/api").strip()
+
+    if not bot_token:
+        raise ValueError("BOT_TOKEN is not set")
+    if not database_url:
+        raise ValueError("DATABASE_URL is not set")
+
+    return Settings(
+        bot_token=bot_token,
+        database_url=database_url,
+        default_language=default_language,
+        stars_enabled=stars_enabled,
+        cryptobot_enabled=cryptobot_enabled,
+        cryptobot_token=cryptobot_token,
+        cryptobot_asset=cryptobot_asset,
+        cryptobot_api_base=cryptobot_api_base,
+    )
