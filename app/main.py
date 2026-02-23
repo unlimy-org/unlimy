@@ -7,15 +7,18 @@ from app.config import load_settings
 from app.db.repository import Repository
 from app.handlers.start import router
 from app.services.cryptobot import CryptoBotClient
-from app.services.provisioning import ProvisioningService
+from app.services.master_node import MasterNodeClient
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
 
     settings = load_settings()
     repo = await Repository.create(settings.database_url)
-    provisioning_service = ProvisioningService(repo)
+    master_node_client = MasterNodeClient(settings.master_node_url)
     cryptobot_client = None
     if settings.cryptobot_enabled and settings.cryptobot_token:
         cryptobot_client = CryptoBotClient(
@@ -30,8 +33,9 @@ async def main() -> None:
 
     # Dependency injection for handlers
     dp["repo"] = repo
-    dp["provisioning_service"] = provisioning_service
+    dp["master_node_client"] = master_node_client
     dp["default_language"] = settings.default_language
+    dp["config_poll_interval_sec"] = settings.config_poll_interval_sec
     dp["stars_enabled"] = settings.stars_enabled
     dp["cryptobot_enabled"] = settings.cryptobot_enabled
     dp["cryptobot_asset"] = settings.cryptobot_asset

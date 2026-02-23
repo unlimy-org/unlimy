@@ -118,6 +118,7 @@ def payment_menu(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=tr(lang, f"payment_{key}"), callback_data=f"payment:{key}")]
         for key in PAYMENT_KEYS
     ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "payment_edit_connection"), callback_data="payment:edit_connection")])
     rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:buy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -170,3 +171,17 @@ def cryptobot_invoice_menu(lang: str, order_id: int, invoice_id: int, pay_url: s
             [InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:payment")],
         ]
     )
+
+
+def server_node_menu(lang: str, country: str, nodes: list[tuple[str, int]], back_callback: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{node_id} (ping {ping})",
+                callback_data=f"node:{country}:{node_id}",
+            )
+        ]
+        for node_id, ping in nodes
+    ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

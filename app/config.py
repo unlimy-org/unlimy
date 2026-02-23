@@ -9,6 +9,8 @@ class Settings:
     bot_token: str
     database_url: str
     default_language: str = "en"
+    master_node_url: str = "http://127.0.0.1:6767"
+    config_poll_interval_sec: int = 15
     stars_enabled: bool = True
     cryptobot_enabled: bool = False
     cryptobot_token: str = ""
@@ -23,6 +25,8 @@ def load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     database_url = os.getenv("DATABASE_URL", "").strip()
     default_language = os.getenv("DEFAULT_LANGUAGE", "en").strip().lower()
+    master_node_url = os.getenv("MASTER_NODE_URL", "http://127.0.0.1:6767").strip()
+    config_poll_interval_sec = int(os.getenv("CONFIG_POLL_INTERVAL_SEC", "15").strip())
     stars_enabled = os.getenv("STARS_ENABLED", "true").strip().lower() == "true"
     cryptobot_enabled = os.getenv("CRYPTOBOT_ENABLED", "false").strip().lower() == "true"
     cryptobot_token = os.getenv("CRYPTOBOT_TOKEN", "").strip()
@@ -38,6 +42,8 @@ def load_settings() -> Settings:
         bot_token=bot_token,
         database_url=database_url,
         default_language=default_language,
+        master_node_url=master_node_url,
+        config_poll_interval_sec=config_poll_interval_sec,
         stars_enabled=stars_enabled,
         cryptobot_enabled=cryptobot_enabled,
         cryptobot_token=cryptobot_token,

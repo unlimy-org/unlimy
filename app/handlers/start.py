@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import logging
 from typing import Optional
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, LabeledPrice, Message, PreCheckoutQuery
+from aiogram.filters import Command, CommandStart
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
 
-from app.db.repository import OrderData, Repository
+from app.db.repository import ConnectionData, OrderData, Repository, ServerData
 from app.keyboards.inline import (
     buy_menu,
     cryptobot_invoice_menu,
@@ -23,16 +26,17 @@ from app.keyboards.inline import (
     payment_menu,
     payment_retry_menu,
     payment_simulation_menu,
-    ready_months_menu,
     ready_info_menu,
+    ready_months_menu,
     ready_plan_menu,
+    server_node_menu,
     summary_menu,
 )
 from app.locales.translations import LANGUAGE_LABELS, tr
 from app.services.catalog import (
+    SERVER_KEYS,
     build_custom_plan_code,
     build_ready_plan_code,
-    custom_pricing,
     format_usd,
     get_ready_option,
     list_ready_options,
@@ -41,10 +45,11 @@ from app.services.catalog import (
     parse_ready_plan_code,
 )
 from app.services.cryptobot import CryptoBotClient, CryptoBotError
-from app.services.provisioning import ProvisioningResult, ProvisioningService
+from app.services.master_node import MasterNodeClient, MasterNodeError
 from app.services.ui import delete_last_bot_message, replace_bot_message
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,6 +62,10 @@ class Offer:
     server: str
     protocol: str
     features: str
+    months: int
+    devices: int
+    speed_limits: str
+    data_limits: str
 
 
 def _resolve_lang(user_lang: Optional[str], default_lang: str) -> str:
@@ -90,24 +99,57 @@ def _protocol_label(protocol: str) -> str:
     return protocol.title()
 
 
-def _offer_from_plan(plan_code: str) -> Optional[Offer]:
+def _q2(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _q0(value: Decimal) -> int:
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+async def _cfg_decimal(repo: Repository, key: str, default: Decimal) -> Decimal:
+    raw = await repo.get_config_value(key)
+    if raw is None:
+        return default
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, TypeError):
+        return default
+
+
+async def _offer_from_plan(repo: Repository, plan_code: str) -> Optional[Offer]:
+    usd_to_rub = await _cfg_decimal(repo, "pricing.usd_to_rub", Decimal("77"))
+    usd_to_stars = await _cfg_decimal(repo, "pricing.usd_to_stars", Decimal("66.67"))
+
     ready = parse_ready_plan_code(plan_code)
     if ready:
+        usd = await _cfg_decimal(repo, f"pricing.plan.{plan_code}.usd", ready.usd)
+        rub = _q0(usd * usd_to_rub)
+        stars = _q0(usd * usd_to_stars)
         return Offer(
             plan_code=plan_code,
             title=f"{ready.months} мес • {ready.plan_code.upper()}",
-            usd=ready.usd,
-            rub=ready.rub,
-            stars=ready.stars,
+            usd=_q2(usd),
+            rub=rub,
+            stars=stars,
             server="auto",
             protocol="wireguard",
             features=ready.short_features,
+            months=ready.months,
+            devices=ready.devices,
+            speed_limits=ready.speed,
+            data_limits=ready.traffic,
         )
 
     custom = parse_custom_plan_code(plan_code)
     if custom:
         server, protocol, months, devices = custom
-        usd, rub, stars = custom_pricing(months, devices)
+        # Configurable custom tariff formula with safe fallbacks.
+        base_per_month = await _cfg_decimal(repo, "pricing.custom.base_usd_per_month", Decimal("3.00"))
+        extra_device_per_month = await _cfg_decimal(repo, "pricing.custom.extra_device_usd_per_month", Decimal("0.90"))
+        usd = _q2(base_per_month * Decimal(months) + extra_device_per_month * Decimal(max(devices - 1, 0)) * Decimal(months))
+        rub = _q0(usd * usd_to_rub)
+        stars = _q0(usd * usd_to_stars)
         return Offer(
             plan_code=plan_code,
             title=f"CUSTOM • {months} мес",
@@ -117,6 +159,10 @@ def _offer_from_plan(plan_code: str) -> Optional[Offer]:
             server=server,
             protocol=protocol,
             features=f"{devices} устройств • Индивидуальный набор",
+            months=months,
+            devices=devices,
+            speed_limits="custom",
+            data_limits="custom",
         )
     return None
 
@@ -126,7 +172,7 @@ def _offer_text(lang: str, offer: Offer, payment_label: str = "-") -> str:
         f"{offer.title}\n"
         f"${format_usd(offer.usd)} • {offer.rub} ₽ • {offer.stars} ⭐\n"
         f"{offer.features}\n\n"
-        f"Сервер: {tr(lang, f'server_{offer.server}')}\n"
+        f"Сервер: {tr(lang, f'server_{offer.server}') if offer.server in {'de','fi','no','nl','auto'} else offer.server}\n"
         f"Протокол: {_protocol_label(offer.protocol)}\n"
         f"Оплата: {payment_label}"
     )
@@ -138,74 +184,323 @@ def _ready_tariffs_details_text(lang: str) -> str:
         lines.append(f"{plan.badge} {plan.name}")
         lines.append(plan.description)
         for opt in list_ready_options(plan.code):
-            lines.append(
-                f"{opt.months} мес: ${format_usd(opt.usd)} • {opt.rub} ₽ • {opt.stars} ⭐"
-            )
+            lines.append(f"{opt.months} мес: ${format_usd(opt.usd)} • {opt.rub} ₽ • {opt.stars} ⭐")
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def _purchase_text(lang: str, order: OrderData) -> str:
-    offer = _offer_from_plan(order.plan)
-    if offer:
-        plan_label = f"{offer.title}\n${format_usd(offer.usd)} • {offer.rub} ₽ • {offer.stars} ⭐"
-    else:
-        plan_label = order.plan
-    return tr(lang, "purchase_success_body").format(
-        order_id=order.id,
-        plan=plan_label,
-        server=tr(lang, f"server_{order.server}"),
-        protocol=_protocol_label(order.protocol),
-        payment=tr(lang, f"payment_{order.payment_method}"),
-    )
+def _history_text(lang: str, orders: list[OrderData]) -> str:
+    if not orders:
+        return tr(lang, "orders_empty")
+    lines = [tr(lang, "orders_title"), ""]
+    for o in orders:
+        lines.append(f"#{o.id} • {o.status} • ${o.amount_usd}")
+        lines.append(f"{o.plan} | {o.server} | {_protocol_label(o.protocol)} | {o.payment_method}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
-async def _mark_paid_and_respond(
-    call_or_msg,
-    repo: Repository,
-    provisioning_service: ProvisioningService,
+def _connections_text(lang: str, conns: list[ConnectionData]) -> str:
+    if not conns:
+        return tr(lang, "connections_empty")
+    lines = [tr(lang, "connections_title"), ""]
+    for c in conns:
+        lines.append(f"#{c.id} • {c.status} • {c.server_id} • {_protocol_label(c.protocol)}")
+    return "\n".join(lines)
+
+
+def _connections_menu(lang: str, conns: list[ConnectionData]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"#{c.id} {c.server_id} ({c.status})", callback_data=f"renew_pick:{c.id}")]
+        for c in conns[:10]
+    ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back_to_main"), callback_data="back:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _country_menu(lang: str, prefix: str, back_callback: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=tr(lang, f"server_{key}"), callback_data=f"{prefix}:{key}")]
+        for key in SERVER_KEYS
+    ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _sync_servers(master_node_client: MasterNodeClient, repo: Repository) -> list[ServerData]:
+    try:
+        servers = await master_node_client.get_servers()
+    except MasterNodeError:
+        return []
+
+    out: list[ServerData] = []
+    for s in servers:
+        row = ServerData(
+            server_id=s.server_id,
+            white_ip=s.white_ip,
+            server_pwd="",
+            country=s.country,
+            ssh_key="",
+            create_date="",
+            status=s.status,
+            stats=s.stats,
+            ping_ms=s.ping_ms,
+        )
+        await repo.upsert_server_data(row)
+        out.append(row)
+    return out
+
+
+async def _server_nodes_for_country(master_node_client: MasterNodeClient, repo: Repository, country: str) -> list[tuple[str, int]]:
+    await _sync_servers(master_node_client, repo)
+    rows = await repo.list_servers_by_country(country)
+    if not rows:
+        return []
+    return [(r.server_id, r.ping_ms) for r in rows if r.status in {"up", "alive", "ok", "unknown"}]
+
+
+def _expiry_iso(months: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=30 * max(months, 1))).isoformat()
+
+
+async def _poll_master_task(
     bot,
+    repo: Repository,
+    master_node_client: MasterNodeClient,
+    poll_interval_sec: int,
+    tg_id: int,
+    chat_id: int,
+    connection_id: int,
+    task_id: str,
     lang: str,
-    order: OrderData,
 ) -> None:
-    await repo.update_order_status(order.id, order.tg_id, "paid")
-    await repo.log_payment_event(
-        order_id=order.id,
-        tg_id=order.tg_id,
-        payment_method=order.payment_method,
-        event_type="succeeded",
-        details="payment_confirmed",
+    logger.info(
+        "config_poll_started tg_id=%s connection_id=%s task_id=%s interval=%s",
+        tg_id,
+        connection_id,
+        task_id,
+        poll_interval_sec,
     )
-    await repo.reset_draft(order.tg_id)
-    provision: ProvisioningResult = await provisioning_service.enqueue_after_payment(order)
+    for attempt in range(1, 41):
+        try:
+            status = await master_node_client.get_task_status(task_id)
+        except MasterNodeError:
+            status = None
+            logger.exception(
+                "config_poll_request_failed tg_id=%s connection_id=%s task_id=%s attempt=%s",
+                tg_id,
+                connection_id,
+                task_id,
+                attempt,
+            )
 
-    chat_id = call_or_msg.chat.id if isinstance(call_or_msg, Message) else call_or_msg.message.chat.id
+        if status and status.status in {"done", "ready", "success"} and status.config_text:
+            logger.info(
+                "config_poll_ready tg_id=%s connection_id=%s task_id=%s attempt=%s config_len=%s",
+                tg_id,
+                connection_id,
+                task_id,
+                attempt,
+                len(status.config_text),
+            )
+            await repo.update_connection_task(connection_id, tg_id, "active", task_id=task_id, config_text=status.config_text)
+            await replace_bot_message(
+                bot=bot,
+                repo=repo,
+                chat_id=chat_id,
+                tg_id=tg_id,
+                text=status.config_text,
+                reply_markup=payment_done_menu(lang),
+            )
+            return
+
+        if status and status.status in {"failed", "error"}:
+            logger.error(
+                "config_poll_failed tg_id=%s connection_id=%s task_id=%s attempt=%s message=%s",
+                tg_id,
+                connection_id,
+                task_id,
+                attempt,
+                status.message,
+            )
+            await repo.update_connection_task(connection_id, tg_id, "failed", task_id=task_id)
+            await replace_bot_message(
+                bot=bot,
+                repo=repo,
+                chat_id=chat_id,
+                tg_id=tg_id,
+                text=tr(lang, "config_failed"),
+                reply_markup=payment_done_menu(lang),
+            )
+            return
+
+        logger.info(
+            "config_poll_pending tg_id=%s connection_id=%s task_id=%s attempt=%s status=%s",
+            tg_id,
+            connection_id,
+            task_id,
+            attempt,
+            status.status if status else "unknown",
+        )
+        await asyncio.sleep(max(5, poll_interval_sec))
+
+    logger.error("config_poll_timeout tg_id=%s connection_id=%s task_id=%s", tg_id, connection_id, task_id)
     await replace_bot_message(
         bot=bot,
         repo=repo,
         chat_id=chat_id,
-        tg_id=order.tg_id,
-        text=(
-            f"{tr(lang, 'purchase_success_title')}\n\n{_purchase_text(lang, order)}\n\n"
-            + tr(lang, "provisioning_stub_info").format(
-                job_id=provision.job_id,
-                node=provision.slave_node,
-                status=provision.status,
-            )
-        ),
+        tg_id=tg_id,
+        text=tr(lang, "config_timeout"),
         reply_markup=payment_done_menu(lang),
+    )
+
+
+async def _start_config_build(
+    *,
+    bot,
+    repo: Repository,
+    master_node_client: MasterNodeClient,
+    poll_interval_sec: int,
+    tg_id: int,
+    chat_id: int,
+    order_id: int,
+    offer: Offer,
+    lang: str,
+) -> None:
+    logger.info(
+        "config_create_started tg_id=%s order_id=%s server=%s protocol=%s",
+        tg_id,
+        order_id,
+        offer.server,
+        offer.protocol,
+    )
+    connection_id = await repo.create_connection(
+        tg_id=tg_id,
+        order_id=order_id,
+        server_id=offer.server,
+        protocol=offer.protocol,
+        speed_limits=offer.speed_limits,
+        devices_limits=str(offer.devices),
+        data_limits=offer.data_limits,
+        expiration_date=_expiry_iso(offer.months),
+        status="pending",
+    )
+
+    payload = {
+        "order_id": order_id,
+        "connection_id": connection_id,
+        "tg_id": tg_id,
+        "plan": offer.plan_code,
+        "server_id": offer.server,
+        "protocol": offer.protocol,
+    }
+
+    try:
+        created = await master_node_client.create_config(payload)
+    except MasterNodeError:
+        logger.exception(
+            "config_create_master_error tg_id=%s order_id=%s connection_id=%s",
+            tg_id,
+            order_id,
+            connection_id,
+        )
+        await repo.update_connection_task(connection_id, tg_id, "failed")
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=chat_id,
+            tg_id=tg_id,
+            text=tr(lang, "config_create_error"),
+            reply_markup=payment_done_menu(lang),
+        )
+        return
+
+    logger.info(
+        "config_create_task_accepted tg_id=%s order_id=%s connection_id=%s task_id=%s",
+        tg_id,
+        order_id,
+        connection_id,
+        created.task_id,
+    )
+    await repo.update_connection_task(connection_id, tg_id, "creating", task_id=created.task_id)
+    asyncio.create_task(
+        _poll_master_task(
+            bot=bot,
+            repo=repo,
+            master_node_client=master_node_client,
+            poll_interval_sec=poll_interval_sec,
+            tg_id=tg_id,
+            chat_id=chat_id,
+            connection_id=connection_id,
+            task_id=created.task_id,
+            lang=lang,
+        )
+    )
+
+
+async def _complete_paid_order(
+    *,
+    call_or_msg,
+    repo: Repository,
+    bot,
+    master_node_client: MasterNodeClient,
+    poll_interval_sec: int,
+    lang: str,
+    order: OrderData,
+) -> None:
+    logger.info(
+        "payment_completed tg_id=%s order_id=%s method=%s",
+        order.tg_id,
+        order.id,
+        order.payment_method,
+    )
+    await repo.update_order_status(order.id, order.tg_id, "paid")
+    await repo.log_payment_event(order.id, order.tg_id, order.payment_method, "succeeded", "payment_confirmed")
+
+    offer = await _offer_from_plan(repo, order.plan)
+    if not offer:
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=call_or_msg.chat.id if isinstance(call_or_msg, Message) else call_or_msg.message.chat.id,
+            tg_id=order.tg_id,
+            text=tr(lang, "pay_missing_draft"),
+            reply_markup=main_menu(lang),
+        )
+        return
+
+    offer.server = order.server
+    offer.protocol = order.protocol
+
+    chat_id = call_or_msg.chat.id if isinstance(call_or_msg, Message) else call_or_msg.message.chat.id
+    await replace_bot_message(bot=bot, repo=repo, chat_id=chat_id, tg_id=order.tg_id, text=tr(lang, "config_starting"), reply_markup=payment_done_menu(lang))
+    await repo.reset_draft(order.tg_id)
+
+    await _start_config_build(
+        bot=bot,
+        repo=repo,
+        master_node_client=master_node_client,
+        poll_interval_sec=poll_interval_sec,
+        tg_id=order.tg_id,
+        chat_id=chat_id,
+        order_id=order.id,
+        offer=offer,
+        lang=lang,
     )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, repo: Repository, default_language: str, bot):
     existing_user = await repo.get_user(message.from_user.id)
+    username = message.from_user.username or ""
+    full_name = " ".join(p for p in [message.from_user.first_name, message.from_user.last_name] if p).strip()
     if not existing_user:
         initial_lang = _detect_initial_lang(message.from_user.language_code, default_language)
-        await repo.ensure_user(message.from_user.id, initial_lang)
+        await repo.ensure_user(message.from_user.id, initial_lang, username=username, name=full_name)
         lang = initial_lang
     else:
         lang = _resolve_lang(existing_user.language, default_language)
+        await repo.ensure_user(message.from_user.id, lang, username=username, name=full_name)
 
     await repo.reset_draft(message.from_user.id)
     try:
@@ -219,6 +514,42 @@ async def cmd_start(message: Message, repo: Repository, default_language: str, b
         tg_id=message.from_user.id,
         text=tr(lang, "welcome"),
         reply_markup=main_menu(lang),
+    )
+
+
+@router.message(Command("orders"))
+async def cmd_orders(message: Message, repo: Repository, default_language: str, bot):
+    lang = await _get_user_lang(repo, message.from_user.id, default_language)
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except TelegramBadRequest:
+        pass
+    orders = await repo.list_orders_for_user(message.from_user.id, limit=15)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=message.chat.id,
+        tg_id=message.from_user.id,
+        text=_history_text(lang, orders),
+        reply_markup=main_menu(lang),
+    )
+
+
+@router.message(Command("myconfigs"))
+async def cmd_myconfigs(message: Message, repo: Repository, default_language: str, bot):
+    lang = await _get_user_lang(repo, message.from_user.id, default_language)
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except TelegramBadRequest:
+        pass
+    conns = await repo.list_connections_for_user(message.from_user.id, limit=10)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=message.chat.id,
+        tg_id=message.from_user.id,
+        text=_connections_text(lang, conns),
+        reply_markup=_connections_menu(lang, conns),
     )
 
 
@@ -238,7 +569,8 @@ async def on_successful_stars_payment(
     message: Message,
     repo: Repository,
     default_language: str,
-    provisioning_service: ProvisioningService,
+    master_node_client: MasterNodeClient,
+    config_poll_interval_sec: int,
     bot,
 ):
     lang = await _get_user_lang(repo, message.from_user.id, default_language)
@@ -256,14 +588,16 @@ async def on_successful_stars_payment(
     if not order:
         return
 
-    await repo.log_payment_event(
-        order_id=order.id,
-        tg_id=order.tg_id,
-        payment_method=order.payment_method,
-        event_type="stars_payment_update",
-        details=f"telegram_charge_id={payment.telegram_payment_charge_id}",
+    await repo.log_payment_event(order.id, order.tg_id, order.payment_method, "stars_payment_update", f"telegram_charge_id={payment.telegram_payment_charge_id}")
+    await _complete_paid_order(
+        call_or_msg=message,
+        repo=repo,
+        bot=bot,
+        master_node_client=master_node_client,
+        poll_interval_sec=config_poll_interval_sec,
+        lang=lang,
+        order=order,
     )
-    await _mark_paid_and_respond(message, repo, provisioning_service, bot, lang, order)
 
 
 @router.message(F.text)
@@ -275,14 +609,7 @@ async def ignore_text_messages(_: Message):
 async def open_language_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=tr(lang, "lang_title"),
-        reply_markup=language_menu(lang),
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "lang_title"), reply_markup=language_menu(lang))
 
 
 @router.callback_query(F.data.startswith("lang:"))
@@ -290,16 +617,10 @@ async def choose_language(call: CallbackQuery, repo: Repository, default_languag
     await call.answer()
     code = call.data.split(":", 1)[1]
     lang = code if code in LANGUAGE_LABELS else _resolve_lang(default_language, "en")
-    await repo.ensure_user(call.from_user.id, lang)
+    user = await repo.get_user(call.from_user.id)
+    await repo.ensure_user(call.from_user.id, lang, username=(user.username if user else ""), name=(user.name if user else ""))
     await repo.set_language(call.from_user.id, lang)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=tr(lang, "welcome"),
-        reply_markup=main_menu(lang),
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "welcome"), reply_markup=main_menu(lang))
 
 
 @router.callback_query(F.data == "menu:buy")
@@ -307,42 +628,21 @@ async def open_buy_menu(call: CallbackQuery, repo: Repository, default_language:
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await repo.reset_draft(call.from_user.id)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=tr(lang, "buy_title"),
-        reply_markup=buy_menu(lang),
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "buy_title"), reply_markup=buy_menu(lang))
 
 
 @router.callback_query(F.data == "buy:ready")
 async def open_ready_plans(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=tr(lang, "ready_plan_title"),
-        reply_markup=ready_plan_menu(lang),
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "ready_plan_title"), reply_markup=ready_plan_menu(lang))
 
 
 @router.callback_query(F.data == "ready:info")
 async def open_ready_tariffs_info(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=_ready_tariffs_details_text(lang),
-        reply_markup=ready_info_menu(lang),
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=_ready_tariffs_details_text(lang), reply_markup=ready_info_menu(lang))
 
 
 @router.callback_query(F.data.startswith("ready_plan:"))
@@ -350,14 +650,7 @@ async def choose_ready_plan(call: CallbackQuery, repo: Repository, default_langu
     await call.answer()
     plan_code = call.data.split(":", 1)[1]
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=tr(lang, "ready_months_title"),
-        reply_markup=ready_months_menu(lang, plan_code),
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "ready_months_title"), reply_markup=ready_months_menu(lang, plan_code))
 
 
 @router.callback_query(F.data.startswith("ready_month:"))
@@ -371,31 +664,17 @@ async def choose_ready_month(call: CallbackQuery, repo: Repository, default_lang
         months = 1
     option = get_ready_option(plan_code, months)
     if not option:
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_missing_draft"),
-            reply_markup=ready_plan_menu(lang),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_draft"), reply_markup=ready_plan_menu(lang))
         return
 
     plan = build_ready_plan_code(plan_code, months)
     await repo.upsert_draft(call.from_user.id, plan=plan, server="auto", protocol="wireguard")
-    offer = _offer_from_plan(plan)
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=_offer_text(lang, offer, payment_label=tr(lang, "payment_not_selected")),
-        reply_markup=payment_menu(lang),
-    )
+    offer = await _offer_from_plan(repo, plan)
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=_offer_text(lang, offer, payment_label=tr(lang, "payment_not_selected")), reply_markup=payment_menu(lang))
 
 
 @router.callback_query(F.data == "buy:custom")
-async def open_custom_server(call: CallbackQuery, repo: Repository, default_language: str, bot):
+async def open_custom_country(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await replace_bot_message(
@@ -409,9 +688,30 @@ async def open_custom_server(call: CallbackQuery, repo: Repository, default_lang
 
 
 @router.callback_query(F.data.startswith("custom_server:"))
-async def choose_custom_server(call: CallbackQuery, repo: Repository, default_language: str, bot):
+async def choose_custom_country(call: CallbackQuery, repo: Repository, default_language: str, master_node_client: MasterNodeClient, bot):
     await call.answer()
-    server = call.data.split(":", 1)[1]
+    country = call.data.split(":", 1)[1]
+    if "|" in country:
+        country = country.split("|", 1)[0]
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    nodes = await _server_nodes_for_country(master_node_client, repo, country)
+    if not nodes:
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "servers_unavailable"), reply_markup=custom_server_menu(lang))
+        return
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "custom_node_title"),
+        reply_markup=server_node_menu(lang, country, nodes, back_callback="buy:custom"),
+    )
+
+
+@router.callback_query(F.data.startswith("node:"))
+async def choose_server_node(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    _, country, node_id = call.data.split(":", 2)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await replace_bot_message(
         bot=bot,
@@ -419,14 +719,14 @@ async def choose_custom_server(call: CallbackQuery, repo: Repository, default_la
         chat_id=call.message.chat.id,
         tg_id=call.from_user.id,
         text=tr(lang, "custom_protocol_title"),
-        reply_markup=custom_protocol_menu(lang, server),
+        reply_markup=custom_protocol_menu(lang, f"{country}|{node_id}"),
     )
 
 
 @router.callback_query(F.data.startswith("custom_protocol:"))
 async def choose_custom_protocol(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
-    _, server, protocol = call.data.split(":", 2)
+    _, packed_server, protocol = call.data.split(":", 2)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await replace_bot_message(
         bot=bot,
@@ -434,14 +734,14 @@ async def choose_custom_protocol(call: CallbackQuery, repo: Repository, default_
         chat_id=call.message.chat.id,
         tg_id=call.from_user.id,
         text=tr(lang, "custom_months_title"),
-        reply_markup=custom_months_menu(lang, server, protocol),
+        reply_markup=custom_months_menu(lang, packed_server, protocol),
     )
 
 
 @router.callback_query(F.data.startswith("custom_month:"))
 async def choose_custom_month(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
-    _, server, protocol, months_str = call.data.split(":", 3)
+    _, packed_server, protocol, months_str = call.data.split(":", 3)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     months = int(months_str)
     await replace_bot_message(
@@ -450,61 +750,98 @@ async def choose_custom_month(call: CallbackQuery, repo: Repository, default_lan
         chat_id=call.message.chat.id,
         tg_id=call.from_user.id,
         text=tr(lang, "custom_devices_title"),
-        reply_markup=custom_devices_menu(lang, server, protocol, months),
+        reply_markup=custom_devices_menu(lang, packed_server, protocol, months),
     )
 
 
 @router.callback_query(F.data.startswith("custom_devices:"))
 async def choose_custom_devices(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
-    _, server, protocol, months_str, devices_str = call.data.split(":", 4)
+    _, packed_server, protocol, months_str, devices_str = call.data.split(":", 4)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     months = int(months_str)
     devices = int(devices_str)
 
-    plan = build_custom_plan_code(server, protocol, months, devices)
-    await repo.upsert_draft(call.from_user.id, plan=plan, server=server, protocol=protocol)
-    offer = _offer_from_plan(plan)
+    if "|" in packed_server:
+        _country, server_id = packed_server.split("|", 1)
+    else:
+        server_id = packed_server
+
+    plan = build_custom_plan_code(server_id, protocol, months, devices)
+    await repo.upsert_draft(call.from_user.id, plan=plan, server=server_id, protocol=protocol)
+    offer = await _offer_from_plan(repo, plan)
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=_offer_text(lang, offer, payment_label=tr(lang, "payment_not_selected")), reply_markup=payment_menu(lang))
+
+
+@router.callback_query(F.data == "payment:edit_connection")
+async def edit_connection_before_payment(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await replace_bot_message(
         bot=bot,
         repo=repo,
         chat_id=call.message.chat.id,
         tg_id=call.from_user.id,
-        text=_offer_text(lang, offer, payment_label=tr(lang, "payment_not_selected")),
-        reply_markup=payment_menu(lang),
+        text=tr(lang, "edit_connection_title"),
+        reply_markup=_country_menu(lang, prefix="edit_country", back_callback="back:payment"),
     )
+
+
+@router.callback_query(F.data.startswith("edit_country:"))
+async def edit_connection_country(call: CallbackQuery, repo: Repository, default_language: str, master_node_client: MasterNodeClient, bot):
+    await call.answer()
+    country = call.data.split(":", 1)[1]
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    nodes = await _server_nodes_for_country(master_node_client, repo, country)
+    if not nodes:
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "servers_unavailable"), reply_markup=_country_menu(lang, prefix="edit_country", back_callback="back:payment"))
+        return
+    rows = [[InlineKeyboardButton(text=f"{node_id} (ping {ping})", callback_data=f"edit_node:{node_id}")] for node_id, ping in nodes]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="payment:edit_connection")])
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "select_server_node"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("edit_node:"))
+async def edit_connection_node(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    node_id = call.data.split(":", 1)[1]
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    draft = await repo.get_draft(call.from_user.id)
+    protocol = draft.protocol or "wireguard"
+    await repo.upsert_draft(call.from_user.id, server=node_id, protocol=protocol)
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "connection_updated"), reply_markup=payment_menu(lang))
 
 
 @router.callback_query(F.data.startswith("payment:"))
 async def choose_payment(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
     payment = call.data.split(":", 1)[1]
+    if payment == "edit_connection":
+        return
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await repo.upsert_draft(call.from_user.id, payment=payment)
     draft = await repo.get_draft(call.from_user.id)
 
     if not draft.plan:
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_missing_draft"),
-            reply_markup=buy_menu(lang),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_draft"), reply_markup=buy_menu(lang))
         return
 
-    offer = _offer_from_plan(draft.plan)
+    offer = await _offer_from_plan(repo, draft.plan)
     if not offer:
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_missing_draft"),
-            reply_markup=buy_menu(lang),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_draft"), reply_markup=buy_menu(lang))
         return
+
+    if draft.server:
+        offer.server = draft.server
+    if draft.protocol:
+        offer.protocol = draft.protocol
 
     await replace_bot_message(
         bot=bot,
@@ -530,50 +867,31 @@ async def start_payment(
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     draft = await repo.get_draft(call.from_user.id)
-    offer = _offer_from_plan(draft.plan or "")
+    offer = await _offer_from_plan(repo, draft.plan or "")
 
     if not offer or not draft.payment:
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_missing_draft"),
-            reply_markup=main_menu(lang),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_draft"), reply_markup=main_menu(lang))
         return
 
+    if draft.server:
+        offer.server = draft.server
+    if draft.protocol:
+        offer.protocol = draft.protocol
+
     await repo.upsert_draft(call.from_user.id, server=offer.server, protocol=offer.protocol)
-    order_id = await repo.create_order_from_draft(
-        tg_id=call.from_user.id,
-        amount_usd=str(offer.usd),
-    )
+    order_id = await repo.create_order_from_draft(tg_id=call.from_user.id, amount_usd=str(offer.usd))
     if order_id is None:
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_missing_draft"),
-            reply_markup=main_menu(lang),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_draft"), reply_markup=main_menu(lang))
         return
 
     if draft.payment == "sbp":
         await repo.log_payment_event(order_id, call.from_user.id, draft.payment, "started", "local_stub_started")
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_sim_title"),
-            reply_markup=payment_simulation_menu(lang, order_id),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_sim_title"), reply_markup=payment_simulation_menu(lang, order_id))
         return
 
     if draft.payment == "stars":
         if not stars_enabled:
-            await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_unavailable"), payment_menu(lang))
+            await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_unavailable"), reply_markup=payment_menu(lang))
             return
 
         await repo.log_payment_event(order_id, call.from_user.id, draft.payment, "started", f"stars_invoice_created amount={offer.stars}")
@@ -591,7 +909,7 @@ async def start_payment(
 
     if draft.payment == "cryptobot":
         if not cryptobot_enabled or cryptobot_client is None:
-            await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_unavailable"), payment_menu(lang))
+            await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_unavailable"), reply_markup=payment_menu(lang))
             return
 
         try:
@@ -602,21 +920,14 @@ async def start_payment(
                 payload=f"order_{order_id}",
             )
         except CryptoBotError:
-            await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_unavailable"), payment_menu(lang))
+            await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_unavailable"), reply_markup=payment_menu(lang))
             return
 
         await repo.log_payment_event(order_id, call.from_user.id, draft.payment, "started", f"cryptobot_invoice_id={invoice.invoice_id}")
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "cryptobot_invoice_text"),
-            reply_markup=cryptobot_invoice_menu(lang, order_id, invoice.invoice_id, invoice.pay_url),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "cryptobot_invoice_text"), reply_markup=cryptobot_invoice_menu(lang, order_id, invoice.invoice_id, invoice.pay_url))
         return
 
-    await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_unavailable"), payment_menu(lang))
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_unavailable"), reply_markup=payment_menu(lang))
 
 
 @router.callback_query(F.data.startswith("pay:check:cryptobot:"))
@@ -624,7 +935,8 @@ async def check_cryptobot_payment(
     call: CallbackQuery,
     repo: Repository,
     default_language: str,
-    provisioning_service: ProvisioningService,
+    master_node_client: MasterNodeClient,
+    config_poll_interval_sec: int,
     bot,
     cryptobot_enabled: bool,
     cryptobot_client: Optional[CryptoBotClient],
@@ -633,23 +945,23 @@ async def check_cryptobot_payment(
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     parts = call.data.split(":")
     if len(parts) != 5:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), main_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
         return
 
     try:
         order_id = int(parts[3])
         invoice_id = int(parts[4])
     except ValueError:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), main_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
         return
 
     order = await repo.get_order(order_id, call.from_user.id)
     if not order or order.payment_method != "cryptobot":
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), main_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
         return
 
     if not cryptobot_enabled or cryptobot_client is None:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_unavailable"), payment_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_unavailable"), reply_markup=payment_menu(lang))
         return
 
     try:
@@ -658,36 +970,30 @@ async def check_cryptobot_payment(
         invoice = None
 
     if not invoice:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), payment_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=payment_menu(lang))
         return
 
     status = invoice.status.lower()
     if status == "paid":
         await repo.log_payment_event(order_id, call.from_user.id, "cryptobot", "cryptobot_paid", f"invoice_id={invoice_id}")
-        await _mark_paid_and_respond(call, repo, provisioning_service, bot, lang, order)
+        await _complete_paid_order(
+            call_or_msg=call,
+            repo=repo,
+            bot=bot,
+            master_node_client=master_node_client,
+            poll_interval_sec=config_poll_interval_sec,
+            lang=lang,
+            order=order,
+        )
         return
 
     if status in {"expired", "cancelled"}:
         await repo.update_order_status(order_id, call.from_user.id, "failed", f"cryptobot_{status}")
         await repo.log_payment_event(order_id, call.from_user.id, "cryptobot", f"cryptobot_{status}", f"invoice_id={invoice_id}")
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_failed_text").format(order_id=order_id),
-            reply_markup=payment_retry_menu(lang),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_failed_text").format(order_id=order_id), reply_markup=payment_retry_menu(lang))
         return
 
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=tr(lang, "cryptobot_pending"),
-        reply_markup=cryptobot_invoice_menu(lang, order_id, invoice_id, invoice.pay_url),
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "cryptobot_pending"), reply_markup=cryptobot_invoice_menu(lang, order_id, invoice_id, invoice.pay_url))
 
 
 @router.callback_query(F.data.startswith("pay:result:"))
@@ -695,55 +1001,146 @@ async def finish_payment_simulation(
     call: CallbackQuery,
     repo: Repository,
     default_language: str,
-    provisioning_service: ProvisioningService,
+    master_node_client: MasterNodeClient,
+    config_poll_interval_sec: int,
     bot,
 ):
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     parts = call.data.split(":")
     if len(parts) != 4:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), main_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
         return
 
     result = parts[2]
     try:
         order_id = int(parts[3])
     except ValueError:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), main_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
         return
 
     order = await repo.get_order(order_id, call.from_user.id)
     if not order:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), main_menu(lang))
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
         return
 
     if result == "success":
         await repo.log_payment_event(order_id, call.from_user.id, order.payment_method, "stub_success", "local_stub_success")
-        await _mark_paid_and_respond(call, repo, provisioning_service, bot, lang, order)
+        await _complete_paid_order(
+            call_or_msg=call,
+            repo=repo,
+            bot=bot,
+            master_node_client=master_node_client,
+            poll_interval_sec=config_poll_interval_sec,
+            lang=lang,
+            order=order,
+        )
     elif result == "failed":
         await repo.update_order_status(order_id, call.from_user.id, "failed", "local_stub_failure")
         await repo.log_payment_event(order_id, call.from_user.id, order.payment_method, "failed", "local_stub_failure")
-        await replace_bot_message(
-            bot=bot,
-            repo=repo,
-            chat_id=call.message.chat.id,
-            tg_id=call.from_user.id,
-            text=tr(lang, "pay_failed_text").format(order_id=order_id),
-            reply_markup=payment_retry_menu(lang),
-        )
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_failed_text").format(order_id=order_id), reply_markup=payment_retry_menu(lang))
     elif result == "cancel":
         await repo.update_order_status(order_id, call.from_user.id, "cancelled", "local_stub_cancelled")
         await repo.log_payment_event(order_id, call.from_user.id, order.payment_method, "cancelled", "local_stub_cancelled")
-        await replace_bot_message(
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_cancel_text").format(order_id=order_id), reply_markup=payment_retry_menu(lang))
+    else:
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
+
+
+@router.callback_query(F.data.startswith("renew_pick:"))
+async def renew_pick_connection(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    conn_id = call.data.split(":", 1)[1]
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "renew_choose_country"),
+        reply_markup=_country_menu(lang, prefix=f"renew_country:{conn_id}", back_callback="back:main"),
+    )
+
+
+@router.callback_query(F.data.startswith("renew_country:"))
+async def renew_choose_country(call: CallbackQuery, repo: Repository, default_language: str, master_node_client: MasterNodeClient, bot):
+    await call.answer()
+    _, conn_id, country = call.data.split(":", 2)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    nodes = await _server_nodes_for_country(master_node_client, repo, country)
+    if not nodes:
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "servers_unavailable"), reply_markup=_country_menu(lang, prefix=f"renew_country:{conn_id}", back_callback="back:main"))
+        return
+
+    rows = [[InlineKeyboardButton(text=f"{node} (ping {ping})", callback_data=f"renew_node:{conn_id}:{node}")] for node, ping in nodes]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data=f"renew_pick:{conn_id}")])
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "select_server_node"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("renew_node:"))
+async def renew_node(call: CallbackQuery, repo: Repository, default_language: str, master_node_client: MasterNodeClient, config_poll_interval_sec: int, bot):
+    await call.answer()
+    _, conn_id_str, node_id = call.data.split(":", 2)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    try:
+        conn_id = int(conn_id_str)
+    except ValueError:
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
+        return
+
+    old_conn = await repo.get_connection(conn_id, call.from_user.id)
+    if not old_conn:
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "connections_empty"), reply_markup=main_menu(lang))
+        return
+
+    new_conn_id = await repo.create_connection(
+        tg_id=call.from_user.id,
+        order_id=None,
+        server_id=node_id,
+        protocol=old_conn.protocol,
+        speed_limits=old_conn.speed_limits,
+        devices_limits=old_conn.devices_limits,
+        data_limits=old_conn.data_limits,
+        expiration_date=old_conn.expiration_date,
+        status="pending",
+    )
+    payload = {
+        "tg_id": call.from_user.id,
+        "renew_of": old_conn.id,
+        "connection_id": new_conn_id,
+        "server_id": node_id,
+        "protocol": old_conn.protocol,
+    }
+
+    try:
+        created = await master_node_client.request_config_renew(payload)
+    except MasterNodeError:
+        await repo.update_connection_task(new_conn_id, call.from_user.id, "failed")
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "config_create_error"), reply_markup=main_menu(lang))
+        return
+
+    await repo.update_connection_task(new_conn_id, call.from_user.id, "creating", task_id=created.task_id)
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "renew_started"), reply_markup=main_menu(lang))
+    asyncio.create_task(
+        _poll_master_task(
             bot=bot,
             repo=repo,
-            chat_id=call.message.chat.id,
+            master_node_client=master_node_client,
+            poll_interval_sec=config_poll_interval_sec,
             tg_id=call.from_user.id,
-            text=tr(lang, "pay_cancel_text").format(order_id=order_id),
-            reply_markup=payment_retry_menu(lang),
+            chat_id=call.message.chat.id,
+            connection_id=new_conn_id,
+            task_id=created.task_id,
+            lang=lang,
         )
-    else:
-        await replace_bot_message(bot, repo, call.message.chat.id, call.from_user.id, tr(lang, "pay_missing_order"), main_menu(lang))
+    )
 
 
 @router.callback_query(F.data.startswith("back:"))
@@ -765,11 +1162,4 @@ async def on_back(call: CallbackQuery, repo: Repository, default_language: str, 
         text = tr(lang, "welcome")
         kb = main_menu(lang)
 
-    await replace_bot_message(
-        bot=bot,
-        repo=repo,
-        chat_id=call.message.chat.id,
-        tg_id=call.from_user.id,
-        text=text,
-        reply_markup=kb,
-    )
+    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=text, reply_markup=kb)

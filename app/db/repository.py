@@ -10,9 +10,9 @@ import asyncpg
 class UserData:
     tg_id: int
     language: str
+    username: str
+    name: str
     last_bot_message_id: Optional[int]
-    preferred_server: Optional[str]
-    preferred_protocol: Optional[str]
 
 
 @dataclass
@@ -33,6 +33,35 @@ class OrderData:
     payment_method: str
     amount_usd: str
     status: str
+
+
+@dataclass
+class ServerData:
+    server_id: str
+    white_ip: str
+    server_pwd: str
+    country: str
+    ssh_key: str
+    create_date: str
+    status: str
+    stats: str
+    ping_ms: int
+
+
+@dataclass
+class ConnectionData:
+    id: int
+    tg_id: int
+    server_id: str
+    protocol: str
+    create_date: str
+    speed_limits: str
+    devices_limits: str
+    data_limits: str
+    config_text: str
+    expiration_date: str
+    status: str
+    task_id: Optional[str]
 
 
 @dataclass
@@ -65,17 +94,16 @@ class Repository:
                 CREATE TABLE IF NOT EXISTS users (
                     tg_id BIGINT PRIMARY KEY,
                     language TEXT NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
                     last_bot_message_id BIGINT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
             )
-            await conn.execute(
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_server TEXT NULL;"
-            )
-            await conn.execute(
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_protocol TEXT NULL;"
-            )
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';")
+
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS draft_orders (
@@ -88,6 +116,7 @@ class Repository:
                 );
                 """
             )
+
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS vpn_orders (
@@ -108,6 +137,10 @@ class Repository:
                 """
             )
             await conn.execute(
+                "ALTER TABLE vpn_orders ADD COLUMN IF NOT EXISTS amount_usd_numeric NUMERIC(10,2) NULL;"
+            )
+
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payment_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -120,6 +153,7 @@ class Repository:
                 );
                 """
             )
+
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS provisioning_jobs (
@@ -139,23 +173,72 @@ class Repository:
             )
 
             await conn.execute(
-                "ALTER TABLE vpn_orders ADD COLUMN IF NOT EXISTS amount_usd_numeric NUMERIC(10,2) NULL;"
+                """
+                CREATE TABLE IF NOT EXISTS server_data (
+                    server_id TEXT PRIMARY KEY,
+                    white_ip TEXT NOT NULL DEFAULT '',
+                    server_pwd TEXT NOT NULL DEFAULT '',
+                    country TEXT NOT NULL,
+                    ssh_key TEXT NOT NULL DEFAULT '',
+                    create_date TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    stats TEXT NOT NULL DEFAULT '',
+                    ping_ms INTEGER NOT NULL DEFAULT 9999,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
             )
 
-    async def ensure_user(self, tg_id: int, language: str) -> UserData:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS connections (
+                    id BIGSERIAL PRIMARY KEY,
+                    tg_id BIGINT NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+                    order_id BIGINT NULL REFERENCES vpn_orders(id) ON DELETE SET NULL,
+                    server_id TEXT NOT NULL,
+                    protocol TEXT NOT NULL,
+                    create_date TEXT NOT NULL,
+                    speed_limits TEXT NOT NULL DEFAULT '',
+                    devices_limits TEXT NOT NULL DEFAULT '',
+                    data_limits TEXT NOT NULL DEFAULT '',
+                    config_text TEXT NOT NULL DEFAULT '',
+                    expiration_date TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    task_id TEXT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS config_kv (
+                    id BIGSERIAL PRIMARY KEY,
+                    key TEXT UNIQUE NOT NULL,
+                    value TEXT NOT NULL
+                );
+                """
+            )
+
+    async def ensure_user(self, tg_id: int, language: str, username: str = "", name: str = "") -> UserData:
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO users(tg_id, language)
-                VALUES($1, $2)
-                ON CONFLICT (tg_id) DO NOTHING
+                INSERT INTO users(tg_id, language, username, name)
+                VALUES($1, $2, $3, $4)
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    name = EXCLUDED.name,
+                    updated_at = NOW()
                 """,
                 tg_id,
                 language,
+                username,
+                name,
             )
             row = await conn.fetchrow(
                 """
-                SELECT tg_id, language, last_bot_message_id, preferred_server, preferred_protocol
+                SELECT tg_id, language, username, name, last_bot_message_id
                 FROM users
                 WHERE tg_id = $1
                 """,
@@ -164,16 +247,16 @@ class Repository:
             return UserData(
                 tg_id=row["tg_id"],
                 language=row["language"],
+                username=row["username"],
+                name=row["name"],
                 last_bot_message_id=row["last_bot_message_id"],
-                preferred_server=row["preferred_server"],
-                preferred_protocol=row["preferred_protocol"],
             )
 
     async def get_user(self, tg_id: int) -> Optional[UserData]:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT tg_id, language, last_bot_message_id, preferred_server, preferred_protocol
+                SELECT tg_id, language, username, name, last_bot_message_id
                 FROM users
                 WHERE tg_id = $1
                 """,
@@ -184,9 +267,9 @@ class Repository:
         return UserData(
             tg_id=row["tg_id"],
             language=row["language"],
+            username=row["username"],
+            name=row["name"],
             last_bot_message_id=row["last_bot_message_id"],
-            preferred_server=row["preferred_server"],
-            preferred_protocol=row["preferred_protocol"],
         )
 
     async def set_language(self, tg_id: int, language: str) -> None:
@@ -203,19 +286,6 @@ class Repository:
                 "UPDATE users SET last_bot_message_id = $2, updated_at = NOW() WHERE tg_id = $1",
                 tg_id,
                 message_id,
-            )
-
-    async def set_connection_preferences(self, tg_id: int, server: str, protocol: str) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE users
-                SET preferred_server = $2, preferred_protocol = $3, updated_at = NOW()
-                WHERE tg_id = $1
-                """,
-                tg_id,
-                server,
-                protocol,
             )
 
     async def upsert_draft(self, tg_id: int, **fields: str) -> None:
@@ -256,9 +326,6 @@ class Repository:
     async def reset_draft(self, tg_id: int) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute("DELETE FROM draft_orders WHERE tg_id = $1", tg_id)
-
-    async def close(self) -> None:
-        await self.pool.close()
 
     async def create_order_from_draft(self, tg_id: int, amount_usd: str) -> Optional[int]:
         draft = await self.get_draft(tg_id)
@@ -311,6 +378,36 @@ class Repository:
             status=row["status"],
         )
 
+    async def list_orders_for_user(self, tg_id: int, limit: int = 10) -> list[OrderData]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, tg_id, plan, server, protocol, payment_method,
+                    COALESCE(amount_usd_numeric::text, amount_usd::text) AS amount_usd,
+                    status
+                FROM vpn_orders
+                WHERE tg_id = $1
+                ORDER BY id DESC
+                LIMIT $2
+                """,
+                tg_id,
+                limit,
+            )
+        return [
+            OrderData(
+                id=row["id"],
+                tg_id=row["tg_id"],
+                plan=row["plan"],
+                server=row["server"],
+                protocol=row["protocol"],
+                payment_method=row["payment_method"],
+                amount_usd=row["amount_usd"],
+                status=row["status"],
+            )
+            for row in rows
+        ]
+
     async def update_order_status(
         self,
         order_id: int,
@@ -357,6 +454,207 @@ class Repository:
                 details,
             )
 
+    async def upsert_server_data(self, server: ServerData) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO server_data(
+                    server_id, white_ip, server_pwd, country, ssh_key,
+                    create_date, status, stats, ping_ms
+                )
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                ON CONFLICT (server_id) DO UPDATE SET
+                    white_ip = EXCLUDED.white_ip,
+                    server_pwd = EXCLUDED.server_pwd,
+                    country = EXCLUDED.country,
+                    ssh_key = EXCLUDED.ssh_key,
+                    create_date = EXCLUDED.create_date,
+                    status = EXCLUDED.status,
+                    stats = EXCLUDED.stats,
+                    ping_ms = EXCLUDED.ping_ms,
+                    updated_at = NOW()
+                """,
+                server.server_id,
+                server.white_ip,
+                server.server_pwd,
+                server.country,
+                server.ssh_key,
+                server.create_date,
+                server.status,
+                server.stats,
+                server.ping_ms,
+            )
+
+    async def list_servers_by_country(self, country: str) -> list[ServerData]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT server_id, white_ip, server_pwd, country, ssh_key, create_date, status, stats, ping_ms
+                FROM server_data
+                WHERE country = $1
+                ORDER BY ping_ms ASC, server_id ASC
+                """,
+                country.lower(),
+            )
+        return [
+            ServerData(
+                server_id=row["server_id"],
+                white_ip=row["white_ip"],
+                server_pwd=row["server_pwd"],
+                country=row["country"],
+                ssh_key=row["ssh_key"],
+                create_date=row["create_date"],
+                status=row["status"],
+                stats=row["stats"],
+                ping_ms=row["ping_ms"],
+            )
+            for row in rows
+        ]
+
+    async def create_connection(
+        self,
+        tg_id: int,
+        server_id: str,
+        protocol: str,
+        speed_limits: str,
+        devices_limits: str,
+        data_limits: str,
+        expiration_date: str,
+        status: str = "pending",
+        task_id: Optional[str] = None,
+        order_id: Optional[int] = None,
+    ) -> int:
+        async with self.pool.acquire() as conn:
+            new_id = await conn.fetchval(
+                """
+                INSERT INTO connections(
+                    tg_id, order_id, server_id, protocol, create_date,
+                    speed_limits, devices_limits, data_limits, expiration_date, status, task_id
+                )
+                VALUES($1,$2,$3,$4,NOW()::text,$5,$6,$7,$8,$9,$10)
+                RETURNING id
+                """,
+                tg_id,
+                order_id,
+                server_id,
+                protocol,
+                speed_limits,
+                devices_limits,
+                data_limits,
+                expiration_date,
+                status,
+                task_id,
+            )
+        return int(new_id)
+
+    async def update_connection_task(
+        self,
+        connection_id: int,
+        tg_id: int,
+        status: str,
+        task_id: Optional[str] = None,
+        config_text: Optional[str] = None,
+    ) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE connections
+                SET
+                    status = $3,
+                    task_id = COALESCE($4, task_id),
+                    config_text = COALESCE($5, config_text),
+                    updated_at = NOW()
+                WHERE id = $1 AND tg_id = $2
+                """,
+                connection_id,
+                tg_id,
+                status,
+                task_id,
+                config_text,
+            )
+        return result.endswith("1")
+
+    async def list_connections_for_user(self, tg_id: int, limit: int = 10) -> list[ConnectionData]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, tg_id, server_id, protocol, create_date, speed_limits,
+                    devices_limits, data_limits, config_text, expiration_date, status, task_id
+                FROM connections
+                WHERE tg_id = $1
+                ORDER BY id DESC
+                LIMIT $2
+                """,
+                tg_id,
+                limit,
+            )
+        return [
+            ConnectionData(
+                id=row["id"],
+                tg_id=row["tg_id"],
+                server_id=row["server_id"],
+                protocol=row["protocol"],
+                create_date=row["create_date"],
+                speed_limits=row["speed_limits"],
+                devices_limits=row["devices_limits"],
+                data_limits=row["data_limits"],
+                config_text=row["config_text"],
+                expiration_date=row["expiration_date"],
+                status=row["status"],
+                task_id=row["task_id"],
+            )
+            for row in rows
+        ]
+
+    async def get_connection(self, connection_id: int, tg_id: int) -> Optional[ConnectionData]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    id, tg_id, server_id, protocol, create_date, speed_limits,
+                    devices_limits, data_limits, config_text, expiration_date, status, task_id
+                FROM connections
+                WHERE id = $1 AND tg_id = $2
+                """,
+                connection_id,
+                tg_id,
+            )
+        if not row:
+            return None
+        return ConnectionData(
+            id=row["id"],
+            tg_id=row["tg_id"],
+            server_id=row["server_id"],
+            protocol=row["protocol"],
+            create_date=row["create_date"],
+            speed_limits=row["speed_limits"],
+            devices_limits=row["devices_limits"],
+            data_limits=row["data_limits"],
+            config_text=row["config_text"],
+            expiration_date=row["expiration_date"],
+            status=row["status"],
+            task_id=row["task_id"],
+        )
+
+    async def set_config_value(self, key: str, value: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO config_kv(key, value)
+                VALUES($1, $2)
+                ON CONFLICT (key)
+                DO UPDATE SET value = EXCLUDED.value
+                """,
+                key,
+                value,
+            )
+
+    async def get_config_value(self, key: str) -> Optional[str]:
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval("SELECT value FROM config_kv WHERE key = $1", key)
+        return value
+
     async def create_or_get_provisioning_job(
         self,
         order_id: int,
@@ -402,3 +700,6 @@ class Repository:
             status=row["status"],
             config_stub=row["config_stub"],
         )
+
+    async def close(self) -> None:
+        await self.pool.close()
