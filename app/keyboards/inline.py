@@ -73,7 +73,7 @@ def ready_plan_menu(lang: str) -> InlineKeyboardMarkup:
         for plan in list_ready_plans()
     ]
     rows.append([InlineKeyboardButton(text=tr(lang, "ready_details_btn"), callback_data="ready:info")])
-    rows.append([InlineKeyboardButton(text=tr(lang, "buy_custom"), callback_data="buy:custom")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "buy_custom"), callback_data="buy:custom", style="primary")])
     rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:buy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
