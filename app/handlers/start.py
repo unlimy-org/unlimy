@@ -55,12 +55,15 @@ from app.services.catalog import (
 )
 from app.services.cryptobot import CryptoBotClient, CryptoBotError
 from app.services.master_node import MasterNodeClient, MasterNodeError
-from app.services.ui import delete_last_bot_message, replace_bot_message
+from app.services.ui import delete_last_bot_message, replace_bot_message, replace_bot_message_with_photo
 
 router = Router()
 logger = logging.getLogger(__name__)
 STATE_TICKET_CREATE = "ticket_create"
 STATE_TICKET_REPLY = "ticket_reply"
+SCREEN_START = "app/assets/images/screen_start.png"
+SCREEN_ACCOUNT = "app/assets/images/screen_account.png"
+SCREEN_LANG = "app/assets/images/screen_lang.png"
 
 
 @dataclass
@@ -573,13 +576,15 @@ async def cmd_start(message: Message, repo: Repository, default_language: str, b
             await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
         except TelegramBadRequest:
             pass
-    await replace_bot_message(
+    await replace_bot_message_with_photo(
         bot=bot,
         repo=repo,
         chat_id=message.chat.id,
         tg_id=message.from_user.id,
-        text=tr(lang, "welcome"),
+        photo_path=SCREEN_START,
+        caption=tr(lang, "welcome"),
         reply_markup=main_menu(lang),
+        cache_key="screen_start",
     )
 
 
@@ -731,7 +736,16 @@ async def open_language_menu(call: CallbackQuery, repo: Repository, default_lang
     await call.answer()
     await repo.clear_user_state(call.from_user.id)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
-    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "lang_title"), reply_markup=language_menu(lang))
+    await replace_bot_message_with_photo(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        photo_path=SCREEN_LANG,
+        caption=tr(lang, "lang_title"),
+        reply_markup=language_menu(lang),
+        cache_key="screen_lang",
+    )
 
 
 @router.callback_query(F.data.startswith("lang:"))
@@ -743,7 +757,16 @@ async def choose_language(call: CallbackQuery, repo: Repository, default_languag
     user = await repo.get_user(call.from_user.id)
     await repo.ensure_user(call.from_user.id, lang, username=(user.username if user else ""), name=(user.name if user else ""))
     await repo.set_language(call.from_user.id, lang)
-    await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "welcome"), reply_markup=main_menu(lang))
+    await replace_bot_message_with_photo(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        photo_path=SCREEN_START,
+        caption=tr(lang, "welcome"),
+        reply_markup=main_menu(lang),
+        cache_key="screen_start",
+    )
 
 
 @router.callback_query(F.data == "menu:buy")
@@ -760,13 +783,15 @@ async def open_account_menu(call: CallbackQuery, repo: Repository, default_langu
     await call.answer()
     await repo.clear_user_state(call.from_user.id)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
-    await replace_bot_message(
+    await replace_bot_message_with_photo(
         bot=bot,
         repo=repo,
         chat_id=call.message.chat.id,
         tg_id=call.from_user.id,
-        text=tr(lang, "account_title"),
+        photo_path=SCREEN_ACCOUNT,
+        caption=tr(lang, "account_title"),
         reply_markup=account_menu(lang),
+        cache_key="screen_account",
     )
 
 
@@ -1545,11 +1570,29 @@ async def on_back(call: CallbackQuery, repo: Repository, default_language: str, 
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
 
     if target == "main":
-        text = tr(lang, "welcome")
-        kb = main_menu(lang)
+        await replace_bot_message_with_photo(
+            bot=bot,
+            repo=repo,
+            chat_id=call.message.chat.id,
+            tg_id=call.from_user.id,
+            photo_path=SCREEN_START,
+            caption=tr(lang, "welcome"),
+            reply_markup=main_menu(lang),
+            cache_key="screen_start",
+        )
+        return
     elif target == "account":
-        text = tr(lang, "account_title")
-        kb = account_menu(lang)
+        await replace_bot_message_with_photo(
+            bot=bot,
+            repo=repo,
+            chat_id=call.message.chat.id,
+            tg_id=call.from_user.id,
+            photo_path=SCREEN_ACCOUNT,
+            caption=tr(lang, "account_title"),
+            reply_markup=account_menu(lang),
+            cache_key="screen_account",
+        )
+        return
     elif target == "buy":
         text = tr(lang, "buy_title")
         kb = buy_menu(lang)
