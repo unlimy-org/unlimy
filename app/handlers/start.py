@@ -567,10 +567,11 @@ async def cmd_start(message: Message, repo: Repository, default_language: str, b
 
     await repo.reset_draft(message.from_user.id)
     await repo.clear_user_state(message.from_user.id)
-    try:
-        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-    except TelegramBadRequest:
-        pass
+    if existing_user:
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+        except TelegramBadRequest:
+            pass
     await replace_bot_message(
         bot=bot,
         repo=repo,
