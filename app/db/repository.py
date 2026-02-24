@@ -64,6 +64,25 @@ class ConnectionData:
     task_id: Optional[str]
 
 
+@dataclass
+class SupportTicketData:
+    id: int
+    tg_id: int
+    status: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class SupportTicketMessageData:
+    id: int
+    ticket_id: int
+    sender_tg_id: int
+    body: str
+    is_admin: bool
+    created_at: str
+
+
 class Repository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -186,6 +205,42 @@ class Repository:
                     id BIGSERIAL PRIMARY KEY,
                     key TEXT UNIQUE NOT NULL,
                     value TEXT NOT NULL
+                );
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS support_tickets (
+                    id BIGSERIAL PRIMARY KEY,
+                    tg_id BIGINT NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS support_ticket_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id BIGINT NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
+                    sender_tg_id BIGINT NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+                    body TEXT NOT NULL,
+                    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS support_user_states (
+                    tg_id BIGINT PRIMARY KEY REFERENCES users(tg_id) ON DELETE CASCADE,
+                    state TEXT NOT NULL,
+                    payload TEXT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
             )
@@ -624,6 +679,202 @@ class Repository:
         async with self.pool.acquire() as conn:
             value = await conn.fetchval("SELECT value FROM config_kv WHERE key = $1", key)
         return value
+
+    async def set_user_state(self, tg_id: int, state: str, payload: Optional[str] = None) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO support_user_states(tg_id, state, payload)
+                VALUES($1, $2, $3)
+                ON CONFLICT (tg_id) DO UPDATE SET
+                    state = EXCLUDED.state,
+                    payload = EXCLUDED.payload,
+                    updated_at = NOW()
+                """,
+                tg_id,
+                state,
+                payload,
+            )
+
+    async def get_user_state(self, tg_id: int) -> tuple[Optional[str], Optional[str]]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT state, payload FROM support_user_states WHERE tg_id = $1",
+                tg_id,
+            )
+        if not row:
+            return None, None
+        return row["state"], row["payload"]
+
+    async def clear_user_state(self, tg_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM support_user_states WHERE tg_id = $1", tg_id)
+
+    async def create_support_ticket(self, tg_id: int, body: str) -> int:
+        async with self.pool.acquire() as conn:
+            ticket_id = await conn.fetchval(
+                """
+                INSERT INTO support_tickets(tg_id, status)
+                VALUES($1, 'open')
+                RETURNING id
+                """,
+                tg_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO support_ticket_messages(ticket_id, sender_tg_id, body, is_admin)
+                VALUES($1, $2, $3, FALSE)
+                """,
+                ticket_id,
+                tg_id,
+                body,
+            )
+        return int(ticket_id)
+
+    async def add_support_ticket_message(self, ticket_id: int, sender_tg_id: int, body: str, is_admin: bool) -> int:
+        async with self.pool.acquire() as conn:
+            msg_id = await conn.fetchval(
+                """
+                INSERT INTO support_ticket_messages(ticket_id, sender_tg_id, body, is_admin)
+                VALUES($1, $2, $3, $4)
+                RETURNING id
+                """,
+                ticket_id,
+                sender_tg_id,
+                body,
+                is_admin,
+            )
+            await conn.execute(
+                "UPDATE support_tickets SET updated_at = NOW() WHERE id = $1",
+                ticket_id,
+            )
+        return int(msg_id)
+
+    async def update_support_ticket_status(self, ticket_id: int, status: str) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE support_tickets
+                SET status = $2, updated_at = NOW()
+                WHERE id = $1
+                """,
+                ticket_id,
+                status,
+            )
+        return result.endswith("1")
+
+    async def get_support_ticket(self, ticket_id: int) -> Optional[SupportTicketData]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, tg_id, status, created_at::text AS created_at, updated_at::text AS updated_at
+                FROM support_tickets
+                WHERE id = $1
+                """,
+                ticket_id,
+            )
+        if not row:
+            return None
+        return SupportTicketData(
+            id=row["id"],
+            tg_id=row["tg_id"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def get_support_ticket_for_user(self, ticket_id: int, tg_id: int) -> Optional[SupportTicketData]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, tg_id, status, created_at::text AS created_at, updated_at::text AS updated_at
+                FROM support_tickets
+                WHERE id = $1 AND tg_id = $2
+                """,
+                ticket_id,
+                tg_id,
+            )
+        if not row:
+            return None
+        return SupportTicketData(
+            id=row["id"],
+            tg_id=row["tg_id"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def list_support_tickets_for_user(self, tg_id: int, limit: int = 20) -> list[SupportTicketData]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, tg_id, status, created_at::text AS created_at, updated_at::text AS updated_at
+                FROM support_tickets
+                WHERE tg_id = $1
+                ORDER BY updated_at DESC
+                LIMIT $2
+                """,
+                tg_id,
+                limit,
+            )
+        return [
+            SupportTicketData(
+                id=row["id"],
+                tg_id=row["tg_id"],
+                status=row["status"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    async def list_open_support_tickets(self, limit: int = 30) -> list[SupportTicketData]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, tg_id, status, created_at::text AS created_at, updated_at::text AS updated_at
+                FROM support_tickets
+                WHERE status = 'open'
+                ORDER BY updated_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [
+            SupportTicketData(
+                id=row["id"],
+                tg_id=row["tg_id"],
+                status=row["status"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    async def list_support_ticket_messages(self, ticket_id: int, limit: int = 30) -> list[SupportTicketMessageData]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, ticket_id, sender_tg_id, body, is_admin, created_at::text AS created_at
+                FROM support_ticket_messages
+                WHERE ticket_id = $1
+                ORDER BY id DESC
+                LIMIT $2
+                """,
+                ticket_id,
+                limit,
+            )
+        return [
+            SupportTicketMessageData(
+                id=row["id"],
+                ticket_id=row["ticket_id"],
+                sender_tg_id=row["sender_tg_id"],
+                body=row["body"],
+                is_admin=row["is_admin"],
+                created_at=row["created_at"],
+            )
+            for row in reversed(rows)
+        ]
 
     async def close(self) -> None:
         await self.pool.close()

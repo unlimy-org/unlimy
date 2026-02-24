@@ -20,6 +20,7 @@ def main_menu(lang: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=tr(lang, "menu_buy"), callback_data="menu:buy", style="primary")],
             [InlineKeyboardButton(text=tr(lang, "menu_orders"), callback_data="menu:orders")],
             [InlineKeyboardButton(text=tr(lang, "menu_configs"), callback_data="menu:configs")],
+            [InlineKeyboardButton(text=tr(lang, "menu_support"), callback_data="menu:support")],
             [InlineKeyboardButton(text=tr(lang, "menu_lang"), callback_data="menu:lang")],
         ]
     )
@@ -40,6 +41,19 @@ def language_menu(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=label, callback_data=f"lang:{code}")]
         for code, label in LANGUAGE_LABELS.items()
     ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def support_menu(lang: str, is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=tr(lang, "info_terms_btn"), callback_data="info:terms")],
+        [InlineKeyboardButton(text=tr(lang, "info_privacy_btn"), callback_data="info:privacy")],
+        [InlineKeyboardButton(text=tr(lang, "support_create"), callback_data="support:create")],
+        [InlineKeyboardButton(text=tr(lang, "support_my"), callback_data="support:my")],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton(text=tr(lang, "support_open_admin"), callback_data="support:open")])
     rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

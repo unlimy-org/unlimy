@@ -12,7 +12,14 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
 
-from app.db.repository import ConnectionData, OrderData, Repository, ServerData
+from app.db.repository import (
+    ConnectionData,
+    OrderData,
+    Repository,
+    ServerData,
+    SupportTicketData,
+    SupportTicketMessageData,
+)
 from app.keyboards.inline import (
     buy_menu,
     cryptobot_invoice_menu,
@@ -30,6 +37,7 @@ from app.keyboards.inline import (
     ready_months_menu,
     ready_plan_menu,
     server_node_menu,
+    support_menu,
     summary_menu,
 )
 from app.locales.translations import LANGUAGE_LABELS, tr
@@ -50,6 +58,8 @@ from app.services.ui import delete_last_bot_message, replace_bot_message
 
 router = Router()
 logger = logging.getLogger(__name__)
+STATE_TICKET_CREATE = "ticket_create"
+STATE_TICKET_REPLY = "ticket_reply"
 
 
 @dataclass
@@ -225,6 +235,59 @@ def _country_menu(lang: str, prefix: str, back_callback: str) -> InlineKeyboardM
     ]
     rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _is_admin(tg_id: int, support_admin_ids: set[int]) -> bool:
+    return tg_id in support_admin_ids
+
+
+def _ticket_status_label(lang: str, status: str) -> str:
+    key = "support_status_open" if status == "open" else "support_status_closed"
+    return tr(lang, key)
+
+
+def _support_ticket_list_menu(lang: str, tickets: list[SupportTicketData], back_callback: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"#{ticket.id} · {_ticket_status_label(lang, ticket.status)} · {ticket.tg_id}",
+                callback_data=f"support:ticket:{ticket.id}",
+            )
+        ]
+        for ticket in tickets[:15]
+    ]
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _support_ticket_view_menu(lang: str, ticket: SupportTicketData, is_admin: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=tr(lang, "support_reply_btn"), callback_data=f"support:reply:{ticket.id}")],
+    ]
+    if is_admin:
+        if ticket.status == "open":
+            rows.append([InlineKeyboardButton(text=tr(lang, "support_close_btn"), callback_data=f"support:status:{ticket.id}:closed")])
+        else:
+            rows.append([InlineKeyboardButton(text=tr(lang, "support_reopen_btn"), callback_data=f"support:status:{ticket.id}:open")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="menu:support")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _support_ticket_text(lang: str, ticket: SupportTicketData, messages: list[SupportTicketMessageData]) -> str:
+    lines = [
+        tr(lang, "support_ticket_title").format(ticket_id=ticket.id),
+        f"{tr(lang, 'support_ticket_status')}: {_ticket_status_label(lang, ticket.status)}",
+        "",
+    ]
+    if not messages:
+        lines.append(tr(lang, "support_empty_messages"))
+    else:
+        for msg in messages[-12:]:
+            role = tr(lang, "support_admin_label") if msg.is_admin else tr(lang, "support_user_label")
+            lines.append(f"{role}: {msg.body}")
+    lines.append("")
+    lines.append(tr(lang, "support_send_hint"))
+    return "\n".join(lines).strip()
 
 
 async def _sync_servers(master_node_client: MasterNodeClient, repo: Repository) -> list[ServerData]:
@@ -503,6 +566,7 @@ async def cmd_start(message: Message, repo: Repository, default_language: str, b
         await repo.ensure_user(message.from_user.id, lang, username=username, name=full_name)
 
     await repo.reset_draft(message.from_user.id)
+    await repo.clear_user_state(message.from_user.id)
     try:
         await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
     except TelegramBadRequest:
@@ -565,13 +629,105 @@ async def on_successful_stars_payment(
 
 
 @router.message(F.text)
-async def ignore_text_messages(_: Message):
-    return
+async def on_text_messages(message: Message, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        return
+
+    state, payload = await repo.get_user_state(message.from_user.id)
+    if not state:
+        return
+
+    lang = await _get_user_lang(repo, message.from_user.id, default_language)
+    chat_id = message.chat.id
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+    except TelegramBadRequest:
+        pass
+
+    if state == STATE_TICKET_CREATE:
+        if not text:
+            await replace_bot_message(
+                bot=bot,
+                repo=repo,
+                chat_id=chat_id,
+                tg_id=message.from_user.id,
+                text=tr(lang, "support_write_prompt"),
+                reply_markup=support_menu(lang, _is_admin(message.from_user.id, support_admin_ids)),
+            )
+            return
+        ticket_id = await repo.create_support_ticket(message.from_user.id, text[:2000])
+        await repo.clear_user_state(message.from_user.id)
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=chat_id,
+            tg_id=message.from_user.id,
+            text=tr(lang, "support_created").format(ticket_id=ticket_id),
+            reply_markup=support_menu(lang, _is_admin(message.from_user.id, support_admin_ids)),
+        )
+        for admin_id in support_admin_ids:
+            if admin_id == message.from_user.id:
+                continue
+            try:
+                await bot.send_message(
+                    admin_id,
+                    tr(lang, "support_admin_new_ticket").format(ticket_id=ticket_id, user_id=message.from_user.id),
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text=f"#{ticket_id}", callback_data=f"support:ticket:{ticket_id}")]]
+                    ),
+                )
+            except TelegramBadRequest:
+                continue
+        return
+
+    if state == STATE_TICKET_REPLY:
+        if not payload or not payload.isdigit():
+            await repo.clear_user_state(message.from_user.id)
+            return
+        ticket_id = int(payload)
+        is_admin = _is_admin(message.from_user.id, support_admin_ids)
+        ticket = await repo.get_support_ticket(ticket_id) if is_admin else await repo.get_support_ticket_for_user(ticket_id, message.from_user.id)
+        if not ticket:
+            await repo.clear_user_state(message.from_user.id)
+            await replace_bot_message(
+                bot=bot,
+                repo=repo,
+                chat_id=chat_id,
+                tg_id=message.from_user.id,
+                text=tr(lang, "support_forbidden"),
+                reply_markup=support_menu(lang, is_admin),
+            )
+            return
+        await repo.add_support_ticket_message(ticket_id, message.from_user.id, text[:2000], is_admin=is_admin)
+        await repo.clear_user_state(message.from_user.id)
+        messages = await repo.list_support_ticket_messages(ticket_id, limit=20)
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=chat_id,
+            tg_id=message.from_user.id,
+            text=_support_ticket_text(lang, ticket, messages),
+            reply_markup=_support_ticket_view_menu(lang, ticket, is_admin),
+        )
+        notify_targets = [ticket.tg_id] if is_admin else [aid for aid in support_admin_ids if aid != message.from_user.id]
+        for target in notify_targets:
+            try:
+                await bot.send_message(
+                    target,
+                    tr(lang, "support_admin_new_reply").format(ticket_id=ticket_id),
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text=f"#{ticket_id}", callback_data=f"support:ticket:{ticket_id}")]]
+                    ),
+                )
+            except TelegramBadRequest:
+                continue
 
 
 @router.callback_query(F.data == "menu:lang")
 async def open_language_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
+    await repo.clear_user_state(call.from_user.id)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "lang_title"), reply_markup=language_menu(lang))
 
@@ -579,6 +735,7 @@ async def open_language_menu(call: CallbackQuery, repo: Repository, default_lang
 @router.callback_query(F.data.startswith("lang:"))
 async def choose_language(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
+    await repo.clear_user_state(call.from_user.id)
     code = call.data.split(":", 1)[1]
     lang = code if code in LANGUAGE_LABELS else _resolve_lang(default_language, "en")
     user = await repo.get_user(call.from_user.id)
@@ -590,6 +747,7 @@ async def choose_language(call: CallbackQuery, repo: Repository, default_languag
 @router.callback_query(F.data == "menu:buy")
 async def open_buy_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
+    await repo.clear_user_state(call.from_user.id)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     await repo.reset_draft(call.from_user.id)
     await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "buy_title"), reply_markup=buy_menu(lang))
@@ -598,6 +756,7 @@ async def open_buy_menu(call: CallbackQuery, repo: Repository, default_language:
 @router.callback_query(F.data == "menu:orders")
 async def open_orders_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
+    await repo.clear_user_state(call.from_user.id)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     orders = await repo.list_orders_for_user(call.from_user.id, limit=15)
     await replace_bot_message(
@@ -613,6 +772,7 @@ async def open_orders_menu(call: CallbackQuery, repo: Repository, default_langua
 @router.callback_query(F.data == "menu:configs")
 async def open_configs_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
+    await repo.clear_user_state(call.from_user.id)
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     conns = await repo.list_connections_for_user(call.from_user.id, limit=10)
     await replace_bot_message(
@@ -622,6 +782,229 @@ async def open_configs_menu(call: CallbackQuery, repo: Repository, default_langu
         tg_id=call.from_user.id,
         text=_connections_text(lang, conns),
         reply_markup=_connections_menu(lang, conns),
+    )
+
+
+@router.callback_query(F.data == "menu:support")
+async def open_support_menu(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    await repo.clear_user_state(call.from_user.id)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    is_admin = _is_admin(call.from_user.id, support_admin_ids)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "support_title"),
+        reply_markup=support_menu(lang, is_admin),
+    )
+
+
+@router.callback_query(F.data == "info:terms")
+async def open_terms(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    await repo.clear_user_state(call.from_user.id)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    is_admin = _is_admin(call.from_user.id, support_admin_ids)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "info_terms_text"),
+        reply_markup=support_menu(lang, is_admin),
+    )
+
+
+@router.callback_query(F.data == "info:privacy")
+async def open_privacy(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    await repo.clear_user_state(call.from_user.id)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    is_admin = _is_admin(call.from_user.id, support_admin_ids)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "info_privacy_text"),
+        reply_markup=support_menu(lang, is_admin),
+    )
+
+
+@router.callback_query(F.data == "support:create")
+async def support_create_ticket(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    await repo.set_user_state(call.from_user.id, STATE_TICKET_CREATE)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "support_write_prompt"),
+        reply_markup=support_menu(lang, _is_admin(call.from_user.id, support_admin_ids)),
+    )
+
+
+@router.callback_query(F.data == "support:my")
+async def support_my_tickets(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    await repo.clear_user_state(call.from_user.id)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    tickets = await repo.list_support_tickets_for_user(call.from_user.id, limit=20)
+    if not tickets:
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=call.message.chat.id,
+            tg_id=call.from_user.id,
+            text=tr(lang, "support_empty"),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text=tr(lang, "back"), callback_data="menu:support")]]
+            ),
+        )
+        return
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "support_my_title"),
+        reply_markup=_support_ticket_list_menu(lang, tickets, back_callback="menu:support"),
+    )
+
+
+@router.callback_query(F.data == "support:open")
+async def support_open_tickets(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    if not _is_admin(call.from_user.id, support_admin_ids):
+        return
+    await repo.clear_user_state(call.from_user.id)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    tickets = await repo.list_open_support_tickets(limit=30)
+    if not tickets:
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=call.message.chat.id,
+            tg_id=call.from_user.id,
+            text=tr(lang, "support_open_empty"),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text=tr(lang, "back"), callback_data="menu:support")]]
+            ),
+        )
+        return
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "support_open_title"),
+        reply_markup=_support_ticket_list_menu(lang, tickets, back_callback="menu:support"),
+    )
+
+
+@router.callback_query(F.data.startswith("support:ticket:"))
+async def support_ticket_view(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    ticket_id_str = call.data.split(":")[-1]
+    if not ticket_id_str.isdigit():
+        return
+    ticket_id = int(ticket_id_str)
+    is_admin = _is_admin(call.from_user.id, support_admin_ids)
+    ticket = await repo.get_support_ticket(ticket_id) if is_admin else await repo.get_support_ticket_for_user(ticket_id, call.from_user.id)
+    if not ticket:
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=call.message.chat.id,
+            tg_id=call.from_user.id,
+            text=tr(lang, "support_forbidden"),
+            reply_markup=support_menu(lang, is_admin),
+        )
+        return
+    messages = await repo.list_support_ticket_messages(ticket.id, limit=30)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=_support_ticket_text(lang, ticket, messages),
+        reply_markup=_support_ticket_view_menu(lang, ticket, is_admin),
+    )
+
+
+@router.callback_query(F.data.startswith("support:reply:"))
+async def support_reply_ticket(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    ticket_id_str = call.data.split(":")[-1]
+    if not ticket_id_str.isdigit():
+        return
+    ticket_id = int(ticket_id_str)
+    is_admin = _is_admin(call.from_user.id, support_admin_ids)
+    ticket = await repo.get_support_ticket(ticket_id) if is_admin else await repo.get_support_ticket_for_user(ticket_id, call.from_user.id)
+    if not ticket:
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=call.message.chat.id,
+            tg_id=call.from_user.id,
+            text=tr(lang, "support_forbidden"),
+            reply_markup=support_menu(lang, is_admin),
+        )
+        return
+    if ticket.status != "open" and not is_admin:
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=call.message.chat.id,
+            tg_id=call.from_user.id,
+            text=tr(lang, "support_forbidden"),
+            reply_markup=support_menu(lang, is_admin),
+        )
+        return
+    await repo.set_user_state(call.from_user.id, STATE_TICKET_REPLY, payload=str(ticket_id))
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "support_reply_prompt").format(ticket_id=ticket_id),
+        reply_markup=_support_ticket_view_menu(lang, ticket, is_admin),
+    )
+
+
+@router.callback_query(F.data.startswith("support:status:"))
+async def support_update_ticket_status(call: CallbackQuery, repo: Repository, default_language: str, support_admin_ids: set[int], bot):
+    await call.answer()
+    if not _is_admin(call.from_user.id, support_admin_ids):
+        return
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    parts = call.data.split(":")
+    if len(parts) != 4 or not parts[2].isdigit():
+        return
+    ticket_id = int(parts[2])
+    status = parts[3]
+    if status not in {"open", "closed"}:
+        return
+    updated = await repo.update_support_ticket_status(ticket_id, status)
+    if not updated:
+        return
+    ticket = await repo.get_support_ticket(ticket_id)
+    if not ticket:
+        return
+    messages = await repo.list_support_ticket_messages(ticket.id, limit=30)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=_support_ticket_text(lang, ticket, messages),
+        reply_markup=_support_ticket_view_menu(lang, ticket, True),
     )
 
 
@@ -1140,6 +1523,7 @@ async def renew_node(call: CallbackQuery, repo: Repository, default_language: st
 @router.callback_query(F.data.startswith("back:"))
 async def on_back(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
+    await repo.clear_user_state(call.from_user.id)
     target = call.data.split(":", 1)[1]
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
 

@@ -40,6 +40,7 @@ async def main() -> None:
     dp["cryptobot_enabled"] = settings.cryptobot_enabled
     dp["cryptobot_asset"] = settings.cryptobot_asset
     dp["cryptobot_client"] = cryptobot_client
+    dp["support_admin_ids"] = set(settings.support_admin_ids)
 
     try:
         await dp.start_polling(bot)
