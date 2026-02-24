@@ -18,9 +18,7 @@ def main_menu(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=tr(lang, "menu_buy"), callback_data="menu:buy", style="primary")],
-            [InlineKeyboardButton(text=tr(lang, "menu_orders"), callback_data="menu:orders")],
-            [InlineKeyboardButton(text=tr(lang, "menu_configs"), callback_data="menu:configs")],
-            [InlineKeyboardButton(text=tr(lang, "menu_support"), callback_data="menu:support")],
+            [InlineKeyboardButton(text=tr(lang, "menu_account"), callback_data="menu:account")],
             [InlineKeyboardButton(text=tr(lang, "menu_lang"), callback_data="menu:lang")],
         ]
     )
@@ -54,8 +52,19 @@ def support_menu(lang: str, is_admin: bool = False) -> InlineKeyboardMarkup:
     ]
     if is_admin:
         rows.append([InlineKeyboardButton(text=tr(lang, "support_open_admin"), callback_data="support:open")])
-    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:main")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:account")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def account_menu(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=tr(lang, "menu_support"), callback_data="menu:support")],
+            [InlineKeyboardButton(text=tr(lang, "menu_orders"), callback_data="menu:orders")],
+            [InlineKeyboardButton(text=tr(lang, "menu_configs"), callback_data="menu:configs")],
+            [InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:main")],
+        ]
+    )
 
 
 def ready_plan_menu(lang: str) -> InlineKeyboardMarkup:

@@ -21,6 +21,7 @@ from app.db.repository import (
     SupportTicketMessageData,
 )
 from app.keyboards.inline import (
+    account_menu,
     buy_menu,
     cryptobot_invoice_menu,
     custom_devices_menu,
@@ -224,7 +225,7 @@ def _connections_menu(lang: str, conns: list[ConnectionData]) -> InlineKeyboardM
         [InlineKeyboardButton(text=f"#{c.id} {c.server_id} ({c.status})", callback_data=f"renew_pick:{c.id}")]
         for c in conns[:10]
     ]
-    rows.append([InlineKeyboardButton(text=tr(lang, "back_to_main"), callback_data="back:main")])
+    rows.append([InlineKeyboardButton(text=tr(lang, "back"), callback_data="back:account")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -754,6 +755,21 @@ async def open_buy_menu(call: CallbackQuery, repo: Repository, default_language:
     await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "buy_title"), reply_markup=buy_menu(lang))
 
 
+@router.callback_query(F.data == "menu:account")
+async def open_account_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
+    await call.answer()
+    await repo.clear_user_state(call.from_user.id)
+    lang = await _get_user_lang(repo, call.from_user.id, default_language)
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=call.message.chat.id,
+        tg_id=call.from_user.id,
+        text=tr(lang, "account_title"),
+        reply_markup=account_menu(lang),
+    )
+
+
 @router.callback_query(F.data == "menu:orders")
 async def open_orders_menu(call: CallbackQuery, repo: Repository, default_language: str, bot):
     await call.answer()
@@ -766,7 +782,7 @@ async def open_orders_menu(call: CallbackQuery, repo: Repository, default_langua
         chat_id=call.message.chat.id,
         tg_id=call.from_user.id,
         text=_history_text(lang, orders),
-        reply_markup=main_menu(lang),
+        reply_markup=account_menu(lang),
     )
 
 
@@ -1531,6 +1547,9 @@ async def on_back(call: CallbackQuery, repo: Repository, default_language: str, 
     if target == "main":
         text = tr(lang, "welcome")
         kb = main_menu(lang)
+    elif target == "account":
+        text = tr(lang, "account_title")
+        kb = account_menu(lang)
     elif target == "buy":
         text = tr(lang, "buy_title")
         kb = buy_menu(lang)
