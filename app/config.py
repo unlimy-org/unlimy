@@ -10,6 +10,7 @@ class Settings:
     database_url: str
     default_language: str = "en"
     master_node_url: str = "http://127.0.0.1:6767"
+    master_node_api_key: str = ""  # X-Api-Key for VPN Gateway (e.g. :8000)
     config_poll_interval_sec: int = 15
     stars_enabled: bool = True
     cryptobot_enabled: bool = False
@@ -17,6 +18,7 @@ class Settings:
     cryptobot_asset: str = "USDT"
     cryptobot_api_base: str = "https://pay.crypt.bot/api"
     support_admin_ids: tuple[int, ...] = ()
+    debug_skip_payment: bool = False
 
 
 
@@ -27,6 +29,7 @@ def load_settings() -> Settings:
     database_url = os.getenv("DATABASE_URL", "").strip()
     default_language = os.getenv("DEFAULT_LANGUAGE", "en").strip().lower()
     master_node_url = os.getenv("MASTER_NODE_URL", "http://127.0.0.1:6767").strip()
+    master_node_api_key = os.getenv("MASTER_NODE_API_KEY", "").strip()
     config_poll_interval_sec = int(os.getenv("CONFIG_POLL_INTERVAL_SEC", "15").strip())
     stars_enabled = os.getenv("STARS_ENABLED", "true").strip().lower() == "true"
     cryptobot_enabled = os.getenv("CRYPTOBOT_ENABLED", "false").strip().lower() == "true"
@@ -39,6 +42,7 @@ def load_settings() -> Settings:
         for item in raw_support_admin_ids.split(",")
         if item.strip().isdigit()
     )
+    debug_skip_payment = os.getenv("DEBUG_SKIP_PAYMENT", "false").strip().lower() == "true"
 
     if not bot_token:
         raise ValueError("BOT_TOKEN is not set")
@@ -50,6 +54,7 @@ def load_settings() -> Settings:
         database_url=database_url,
         default_language=default_language,
         master_node_url=master_node_url,
+        master_node_api_key=master_node_api_key,
         config_poll_interval_sec=config_poll_interval_sec,
         stars_enabled=stars_enabled,
         cryptobot_enabled=cryptobot_enabled,
@@ -57,4 +62,5 @@ def load_settings() -> Settings:
         cryptobot_asset=cryptobot_asset,
         cryptobot_api_base=cryptobot_api_base,
         support_admin_ids=support_admin_ids,
+        debug_skip_payment=debug_skip_payment,
     )
