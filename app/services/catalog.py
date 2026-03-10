@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 
 SERVER_KEYS = ["de", "fi", "no", "nl"]
-PROTOCOL_KEYS = ["hysteria", "vless", "wireguard"]
+PROTOCOL_KEYS = ["vless"]
 PAYMENT_KEYS = ["sbp", "cryptobot", "stars"]
 CUSTOM_MONTH_OPTIONS = [1, 3, 12]
 CUSTOM_DEVICE_OPTIONS = [1, 2, 3, 5, 10]

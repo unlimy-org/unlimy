@@ -106,10 +106,10 @@ async def _get_user_lang(repo: Repository, tg_id: int, default_language: str) ->
 
 
 def _protocol_label(protocol: str) -> str:
+    if protocol == "vless":
+        return "VLESS+Reality"
     if protocol == "wireguard":
         return "WireGuard"
-    if protocol == "vless":
-        return "VLESS"
     return protocol.title()
 
 
@@ -147,7 +147,7 @@ async def _offer_from_plan(repo: Repository, plan_code: str) -> Optional[Offer]:
             rub=rub,
             stars=stars,
             server="auto",
-            protocol="wireguard",
+            protocol="vless",
             features=ready.short_features,
             months=ready.months,
             devices=ready.devices,
@@ -441,37 +441,23 @@ async def _start_config_build(
         offer.server,
         offer.protocol,
     )
-    connection_id = await repo.create_connection(
-        tg_id=tg_id,
-        order_id=order_id,
-        server_id=offer.server,
-        protocol=offer.protocol,
-        speed_limits=offer.speed_limits,
-        devices_limits=str(offer.devices),
-        data_limits=offer.data_limits,
-        expiration_date=_expiry_iso(offer.months),
-        status="pending",
-    )
-
-    payload = {
-        "order_id": order_id,
-        "connection_id": connection_id,
-        "tg_id": tg_id,
-        "plan": offer.plan_code,
-        "server_id": offer.server,
-        "protocol": offer.protocol,
-    }
+    duration_days = 30 * max(offer.months, 1)
 
     try:
-        created = await master_node_client.create_config(payload)
+        result = await master_node_client.add_subscription({
+            "order_id": str(order_id),
+            "telegram_user_id": tg_id,
+            "duration_days": duration_days,
+            "limit_ip": offer.devices,
+            "preferred_server": offer.server if offer.server and offer.server != "auto" else None,
+            "plan_code": offer.plan_code,
+        })
     except MasterNodeError:
         logger.exception(
-            "config_create_master_error tg_id=%s order_id=%s connection_id=%s",
+            "config_create_master_error tg_id=%s order_id=%s",
             tg_id,
             order_id,
-            connection_id,
         )
-        await repo.update_connection_task(connection_id, tg_id, "failed")
         await replace_bot_message(
             bot=bot,
             repo=repo,
@@ -482,26 +468,50 @@ async def _start_config_build(
         )
         return
 
+    if not result.connections:
+        logger.error("config_create_no_connections tg_id=%s order_id=%s", tg_id, order_id)
+        await replace_bot_message(
+            bot=bot,
+            repo=repo,
+            chat_id=chat_id,
+            tg_id=tg_id,
+            text=tr(lang, "config_failed"),
+            reply_markup=payment_done_menu(lang),
+        )
+        return
+
+    conn = result.connections[0]
+    connection_id = await repo.create_connection(
+        tg_id=tg_id,
+        order_id=order_id,
+        server_id=conn.server_name or offer.server,
+        protocol=offer.protocol,
+        speed_limits=offer.speed_limits,
+        devices_limits=str(offer.devices),
+        data_limits=offer.data_limits,
+        expiration_date=conn.expires_at or _expiry_iso(offer.months),
+        status="active",
+        client_uuid=conn.client_uuid,
+        inbound_id=conn.inbound_id,
+        total_gb=conn.total_gb,
+        limit_ip=conn.limit_ip,
+        vless_uri=conn.vless_uri,
+    )
     logger.info(
-        "config_create_task_accepted tg_id=%s order_id=%s connection_id=%s task_id=%s",
+        "config_create_done tg_id=%s order_id=%s connection_id=%s",
         tg_id,
         order_id,
         connection_id,
-        created.task_id,
     )
-    await repo.update_connection_task(connection_id, tg_id, "creating", task_id=created.task_id)
-    asyncio.create_task(
-        _poll_master_task(
-            bot=bot,
-            repo=repo,
-            master_node_client=master_node_client,
-            poll_interval_sec=poll_interval_sec,
-            tg_id=tg_id,
-            chat_id=chat_id,
-            connection_id=connection_id,
-            task_id=created.task_id,
-            lang=lang,
-        )
+
+    config_text = result.subscription_url or conn.vless_uri
+    await replace_bot_message(
+        bot=bot,
+        repo=repo,
+        chat_id=chat_id,
+        tg_id=tg_id,
+        text=config_text,
+        reply_markup=payment_done_menu(lang),
     )
 
 
@@ -1087,7 +1097,7 @@ async def choose_ready_month(call: CallbackQuery, repo: Repository, default_lang
         return
 
     plan = build_ready_plan_code(plan_code, months)
-    await repo.upsert_draft(call.from_user.id, plan=plan, server="auto", protocol="wireguard")
+    await repo.upsert_draft(call.from_user.id, plan=plan, server="auto", protocol="vless")
     offer = await _offer_from_plan(repo, plan)
     await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=_offer_text(lang, offer, payment_label=tr(lang, "payment_not_selected")), reply_markup=payment_menu(lang))
 
@@ -1233,7 +1243,7 @@ async def edit_connection_node(call: CallbackQuery, repo: Repository, default_la
     node_id = call.data.split(":", 1)[1]
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
     draft = await repo.get_draft(call.from_user.id)
-    protocol = draft.protocol or "wireguard"
+    protocol = draft.protocol or "vless"
     await repo.upsert_draft(call.from_user.id, server=node_id, protocol=protocol)
     await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "connection_updated"), reply_markup=payment_menu(lang))
 
@@ -1282,6 +1292,9 @@ async def start_payment(
     cryptobot_enabled: bool,
     cryptobot_client: Optional[CryptoBotClient],
     cryptobot_asset: str,
+    master_node_client: MasterNodeClient,
+    config_poll_interval_sec: int,
+    debug_skip_payment: bool,
 ):
     await call.answer()
     lang = await _get_user_lang(repo, call.from_user.id, default_language)
@@ -1301,6 +1314,24 @@ async def start_payment(
     order_id = await repo.create_order_from_draft(tg_id=call.from_user.id, amount_usd=str(offer.usd))
     if order_id is None:
         await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_draft"), reply_markup=main_menu(lang))
+        return
+
+    if debug_skip_payment:
+        logger.warning("DEBUG_SKIP_PAYMENT: skipping payment for order_id=%s tg_id=%s", order_id, call.from_user.id)
+        order = await repo.get_order(order_id, call.from_user.id)
+        if not order:
+            await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "pay_missing_order"), reply_markup=main_menu(lang))
+            return
+        await repo.log_payment_event(order_id, call.from_user.id, draft.payment or "debug", "debug_skip", "payment_skipped_debug_mode")
+        await _complete_paid_order(
+            call_or_msg=call,
+            repo=repo,
+            bot=bot,
+            master_node_client=master_node_client,
+            poll_interval_sec=config_poll_interval_sec,
+            lang=lang,
+            order=order,
+        )
         return
 
     if draft.payment == "sbp":
@@ -1519,47 +1550,22 @@ async def renew_node(call: CallbackQuery, repo: Repository, default_language: st
         await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "connections_empty"), reply_markup=main_menu(lang))
         return
 
-    new_conn_id = await repo.create_connection(
-        tg_id=call.from_user.id,
-        order_id=None,
-        server_id=node_id,
-        protocol=old_conn.protocol,
-        speed_limits=old_conn.speed_limits,
-        devices_limits=old_conn.devices_limits,
-        data_limits=old_conn.data_limits,
-        expiration_date=old_conn.expiration_date,
-        status="pending",
-    )
-    payload = {
-        "tg_id": call.from_user.id,
-        "renew_of": old_conn.id,
-        "connection_id": new_conn_id,
-        "server_id": node_id,
-        "protocol": old_conn.protocol,
-    }
-
     try:
-        created = await master_node_client.request_config_renew(payload)
+        result = await master_node_client.renew_subscription({
+            "duration_days": 30,
+            "telegram_user_id": call.from_user.id,
+            "server_name": node_id,
+        })
     except MasterNodeError:
-        await repo.update_connection_task(new_conn_id, call.from_user.id, "failed")
         await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "config_create_error"), reply_markup=main_menu(lang))
         return
 
-    await repo.update_connection_task(new_conn_id, call.from_user.id, "creating", task_id=created.task_id)
+    if not result.renewed:
+        await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "config_failed"), reply_markup=main_menu(lang))
+        return
+
+    config_text = result.vless_uri or old_conn.config_text
     await replace_bot_message(bot=bot, repo=repo, chat_id=call.message.chat.id, tg_id=call.from_user.id, text=tr(lang, "renew_started"), reply_markup=main_menu(lang))
-    asyncio.create_task(
-        _poll_master_task(
-            bot=bot,
-            repo=repo,
-            master_node_client=master_node_client,
-            poll_interval_sec=config_poll_interval_sec,
-            tg_id=call.from_user.id,
-            chat_id=call.message.chat.id,
-            connection_id=new_conn_id,
-            task_id=created.task_id,
-            lang=lang,
-        )
-    )
 
 
 @router.callback_query(F.data.startswith("back:"))

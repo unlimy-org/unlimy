@@ -18,7 +18,10 @@ async def main() -> None:
 
     settings = load_settings()
     repo = await Repository.create(settings.database_url)
-    master_node_client = MasterNodeClient(settings.master_node_url)
+    master_node_client = MasterNodeClient(
+        settings.master_node_url,
+        api_key=settings.master_node_api_key or None,
+    )
     cryptobot_client = None
     if settings.cryptobot_enabled and settings.cryptobot_token:
         cryptobot_client = CryptoBotClient(
@@ -41,6 +44,10 @@ async def main() -> None:
     dp["cryptobot_asset"] = settings.cryptobot_asset
     dp["cryptobot_client"] = cryptobot_client
     dp["support_admin_ids"] = set(settings.support_admin_ids)
+    dp["debug_skip_payment"] = settings.debug_skip_payment
+
+    if settings.debug_skip_payment:
+        logging.getLogger(__name__).warning("DEBUG_SKIP_PAYMENT is ON — payments will be skipped!")
 
     try:
         await dp.start_polling(bot)
